@@ -453,6 +453,7 @@ enum dpdk_rx_steer_flags {
 
 struct netdev_dpdk {
     PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline0,
+        dpdk_port_t flow_transfer_proxy_port_id;
         dpdk_port_t port_id;
 
         /* If true, device was attached by rte_eth_dev_attach(). */
@@ -1274,6 +1275,7 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev)
     uint32_t rx_chksm_offload_capa = RTE_ETH_RX_OFFLOAD_UDP_CKSUM |
                                      RTE_ETH_RX_OFFLOAD_TCP_CKSUM |
                                      RTE_ETH_RX_OFFLOAD_IPV4_CKSUM;
+    int ret;
 
     if (netdev_is_flow_api_enabled()) {
         /*
@@ -1285,6 +1287,24 @@ dpdk_eth_dev_init(struct netdev_dpdk *dev)
          * Request delivery of such metadata.
          */
         dpdk_eth_dev_init_rx_metadata(dev);
+    }
+
+    /*
+     * Managing "transfer" flows requires that the user communicate them
+     * via a port which has the privilege to control the embedded switch.
+     * For some vendors, all ports in a given switching domain have
+     * this privilege. For other vendors, it's only one port.
+     *
+     * Get the proxy port ID and remember it for later use.
+     */
+    ret = rte_flow_pick_transfer_proxy(dev->port_id,
+                                       &dev->flow_transfer_proxy_port_id, NULL);
+    if (ret != 0) {
+        /*
+         * The PMD does not indicate the proxy port.
+         * Assume the proxy is unneeded.
+         */
+        dev->flow_transfer_proxy_port_id = dev->port_id;
     }
 
     rte_eth_dev_info_get(dev->port_id, &info);
@@ -4265,8 +4285,10 @@ netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
                    const char *argv[], void *aux OVS_UNUSED)
 {
     struct ds used_interfaces = DS_EMPTY_INITIALIZER;
+    struct netdev_dpdk *dev_self = NULL;
     struct rte_eth_dev_info dev_info;
     dpdk_port_t sibling_port_id;
+    struct netdev_dpdk *dev;
     dpdk_port_t port_id;
     bool used = false;
     char *response;
@@ -4284,8 +4306,6 @@ netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
                   argv[1]);
 
     RTE_ETH_FOREACH_DEV_SIBLING (sibling_port_id, port_id) {
-        struct netdev_dpdk *dev;
-
         LIST_FOR_EACH (dev, list_node, &dpdk_list) {
             if (dev->port_id != sibling_port_id) {
                 continue;
@@ -4304,6 +4324,25 @@ netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
         goto error;
     }
     ds_destroy(&used_interfaces);
+
+    /*
+     * The device being detached may happen to be a flow proxy port
+     * for another device (still attached). If so, do not allow to
+     * detach. Devices dependent on this one must be detached first.
+     */
+    LIST_FOR_EACH (dev, list_node, &dpdk_list) {
+        if (dev->port_id == port_id) {
+            dev_self = dev;
+        } else if (dev->flow_transfer_proxy_port_id == port_id) {
+            response = xasprintf("Device '%s' can not be detached (flow proxy)",
+                                 argv[1]);
+            goto error;
+        }
+    }
+
+    /* Indicate that the device being detached no longer needs a flow proxy. */
+    if (dev_self != NULL)
+        dev_self->flow_transfer_proxy_port_id = port_id;
 
     rte_eth_dev_info_get(port_id, &dev_info);
     rte_eth_dev_close(port_id);
@@ -6064,7 +6103,8 @@ unlock:
 }
 
 int
-netdev_dpdk_get_port_id(struct netdev *netdev)
+netdev_dpdk_get_port_id(struct netdev *netdev,
+                        bool flow_transfer_proxy)
 {
     struct netdev_dpdk *dev;
     int ret = -1;
@@ -6075,7 +6115,7 @@ netdev_dpdk_get_port_id(struct netdev *netdev)
 
     dev = netdev_dpdk_cast(netdev);
     ovs_mutex_lock(&dev->mutex);
-    ret = dev->port_id;
+    ret = flow_transfer_proxy ? dev->flow_transfer_proxy_port_id : dev->port_id;
     ovs_mutex_unlock(&dev->mutex);
 out:
     return ret;
@@ -6118,13 +6158,15 @@ out:
 
 int
 netdev_dpdk_rte_flow_destroy(struct netdev *netdev,
-                             struct rte_flow *rte_flow,
+                             bool transfer, struct rte_flow *rte_flow,
                              struct rte_flow_error *error)
 {
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
     int ret;
 
-    ret = rte_flow_destroy(dev->port_id, rte_flow, error);
+    ret = rte_flow_destroy(transfer ?
+                           dev->flow_transfer_proxy_port_id : dev->port_id,
+                           rte_flow, error);
     return ret;
 }
 
@@ -6138,7 +6180,17 @@ netdev_dpdk_rte_flow_create(struct netdev *netdev,
     struct rte_flow *flow;
     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
 
-    flow = rte_flow_create(dev->port_id, attr, items, actions, error);
+    if (!attr->transfer) {
+        /*
+         * The 1st item in any pattern is a traffic source one.
+         * It is unnecessary in the case of non-transfer rules.
+         */
+        ++(items);
+    }
+
+    flow = rte_flow_create(attr->transfer ?
+                           dev->flow_transfer_proxy_port_id : dev->port_id,
+                           attr, items, actions, error);
     return flow;
 }
 
@@ -6166,7 +6218,8 @@ netdev_dpdk_rte_flow_query_count(struct netdev *netdev,
     }
 
     dev = netdev_dpdk_cast(netdev);
-    ret = rte_flow_query(dev->port_id, rte_flow, actions, query, error);
+    ret = rte_flow_query(dev->flow_transfer_proxy_port_id, rte_flow,
+                         actions, query, error);
     return ret;
 }
 
@@ -6188,8 +6241,8 @@ netdev_dpdk_rte_flow_tunnel_decap_set(struct netdev *netdev,
 
     dev = netdev_dpdk_cast(netdev);
     ovs_mutex_lock(&dev->mutex);
-    ret = rte_flow_tunnel_decap_set(dev->port_id, tunnel, actions,
-                                    num_of_actions, error);
+    ret = rte_flow_tunnel_decap_set(dev->flow_transfer_proxy_port_id, tunnel,
+                                    actions, num_of_actions, error);
     ovs_mutex_unlock(&dev->mutex);
     return ret;
 }
@@ -6210,8 +6263,8 @@ netdev_dpdk_rte_flow_tunnel_match(struct netdev *netdev,
 
     dev = netdev_dpdk_cast(netdev);
     ovs_mutex_lock(&dev->mutex);
-    ret = rte_flow_tunnel_match(dev->port_id, tunnel, items, num_of_items,
-                                error);
+    ret = rte_flow_tunnel_match(dev->flow_transfer_proxy_port_id, tunnel,
+                                items, num_of_items, error);
     ovs_mutex_unlock(&dev->mutex);
     return ret;
 }
@@ -6232,7 +6285,8 @@ netdev_dpdk_rte_flow_get_restore_info(struct netdev *netdev,
 
     dev = netdev_dpdk_cast(netdev);
     ovs_mutex_lock(&dev->mutex);
-    ret = rte_flow_get_restore_info(dev->port_id, m, info, error);
+    ret = rte_flow_get_restore_info(dev->flow_transfer_proxy_port_id,
+                                    m, info, error);
     ovs_mutex_unlock(&dev->mutex);
     return ret;
 }
@@ -6253,8 +6307,8 @@ netdev_dpdk_rte_flow_tunnel_action_decap_release(
 
     dev = netdev_dpdk_cast(netdev);
     ovs_mutex_lock(&dev->mutex);
-    ret = rte_flow_tunnel_action_decap_release(dev->port_id, actions,
-                                               num_of_actions, error);
+    ret = rte_flow_tunnel_action_decap_release(dev->flow_transfer_proxy_port_id,
+                                               actions, num_of_actions, error);
     ovs_mutex_unlock(&dev->mutex);
     return ret;
 }
@@ -6274,8 +6328,8 @@ netdev_dpdk_rte_flow_tunnel_item_release(struct netdev *netdev,
 
     dev = netdev_dpdk_cast(netdev);
     ovs_mutex_lock(&dev->mutex);
-    ret = rte_flow_tunnel_item_release(dev->port_id, items, num_of_items,
-                                       error);
+    ret = rte_flow_tunnel_item_release(dev->flow_transfer_proxy_port_id,
+                                       items, num_of_items, error);
     ovs_mutex_unlock(&dev->mutex);
     return ret;
 }
