@@ -256,6 +256,7 @@ conn_update_expiration(struct conntrack *ct, struct conn *conn,
                 ct_timeout_str[tm], conn->key_node[CT_DIR_FWD].key.zone,
                 conn->tp_id, val);
 
+    conn->tp_timeout = tm;
     atomic_store_relaxed(&conn->expiration, now + val * 1000);
 }
 

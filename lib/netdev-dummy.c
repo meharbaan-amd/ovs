@@ -1533,7 +1533,8 @@ netdev_dummy_flow_put(struct netdev *netdev, struct match *match,
                       struct nlattr *actions OVS_UNUSED,
                       size_t actions_len OVS_UNUSED,
                       const ovs_u128 *ufid, struct offload_info *info,
-                      struct dpif_flow_stats *stats)
+                      struct dpif_flow_stats *stats,
+                      struct conntrack *conntrack OVS_UNUSED)
 {
     struct netdev_dummy *dev = netdev_dummy_cast(netdev);
     struct offloaded_flow *off_flow;

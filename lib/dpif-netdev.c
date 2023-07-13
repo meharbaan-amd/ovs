@@ -2828,7 +2828,7 @@ dp_netdev_flow_offload_put(struct dp_offload_thread_item *item)
     ret = netdev_flow_put(port, &offload->match,
                           CONST_CAST(struct nlattr *, offload->actions),
                           offload->actions_len, &flow->mega_ufid, &info,
-                          NULL);
+                          NULL, dp->conntrack);
     ovs_rwlock_unlock(&dp->port_rwlock);
     netdev_close(port);
 

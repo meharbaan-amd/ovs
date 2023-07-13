@@ -34,6 +34,8 @@
 #include "ovs-rcu.h"
 #include "packets.h"
 #include "uuid.h"
+#include "conntrack.h"
+#include "conntrack-private.h"
 
 VLOG_DEFINE_THIS_MODULE(netdev_offload_dpdk);
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(600, 600);
@@ -56,8 +58,29 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(600, 600);
 struct ct_flow_data {
     struct cmap_node node;
     struct rte_flow *rte_flow;
+    struct conn_key conn_key;
     uint32_t hash;
 };
+
+static void conn_key_extract_from_flow(const struct flow *flow,
+                                       struct conn_key *conn_key)
+{
+    /* Not enough info in struct flow to restore ICMP key. */
+    if (flow->dl_type == htons(ETH_TYPE_IP)) {
+        conn_key->src.addr.ipv4 = flow->ct_nw_src;
+        conn_key->dst.addr.ipv4 = flow->ct_nw_dst;
+    } else {
+        conn_key->src.addr.ipv6 = flow->ct_ipv6_src;
+        conn_key->dst.addr.ipv6 = flow->ct_ipv6_dst;
+    }
+
+    conn_key->src.port = flow->ct_tp_src;
+    conn_key->dst.port = flow->ct_tp_dst;
+
+    conn_key->dl_type = flow->dl_type;
+    conn_key->zone = flow->ct_zone;
+    conn_key->nw_proto = flow->ct_nw_proto;
+}
 
 /*
  * A mapping from ufid to dpdk rte_flow.
@@ -78,6 +101,7 @@ struct ufid_to_rte_flow_data {
     bool dead;
     struct cmap ct_flows;
     struct match match;
+    struct conntrack *conntrack;
 };
 
 struct netdev_offload_dpdk_data {
@@ -235,12 +259,12 @@ hash_ct_tuple(const struct flow *flow)
 {
     struct ct_tuple tuple;
 
-    tuple.src_ipv4 = flow->nw_src;
-    tuple.dst_ipv4 = flow->nw_dst;
-    tuple.src_ipv6 = flow->ipv6_src;
-    tuple.dst_ipv6 = flow->ipv6_dst;
-    tuple.src_port = flow->tp_src;
-    tuple.dst_port = flow->tp_dst;
+    tuple.src_ipv4 = flow->ct_nw_src;
+    tuple.dst_ipv4 = flow->ct_nw_dst;
+    tuple.src_ipv6 = flow->ct_ipv6_src;
+    tuple.dst_ipv6 = flow->ct_ipv6_dst;
+    tuple.src_port = flow->ct_tp_src;
+    tuple.dst_port = flow->ct_tp_dst;
 
     return hash_bytes(&tuple, sizeof tuple, 0);
 }
@@ -250,7 +274,8 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid, struct netdev *netdev,
                            struct netdev *physdev, struct rte_flow *rte_flow,
                            const struct match *match, bool actions_offloaded,
                            bool conntracked,
-                           struct rte_flow_action_handle *action_handle)
+                           struct rte_flow_action_handle *action_handle,
+                           struct conntrack *conntrack)
 {
     size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
     struct cmap *map = offload_data_map(netdev);
@@ -260,6 +285,10 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid, struct netdev *netdev,
 
     if (!map) {
         return NULL;
+    }
+
+    if (!conntrack) {
+        conntracked = false;
     }
 
     data = xzalloc(sizeof *data);
@@ -288,12 +317,14 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid, struct netdev *netdev,
     data->actions_offloaded = actions_offloaded;
     data->creation_tid = netdev_offload_thread_id();
     data->ct = conntracked;
+    data->conntrack = conntracked ? conntrack : NULL;
     data->match = *match;
     ovs_mutex_init(&data->lock);
 
     if (conntracked) {
         ct_data->rte_flow = rte_flow;
         ct_data->hash = hash_ct_tuple(&match->flow);
+        conn_key_extract_from_flow(&match->flow, &ct_data->conn_key);
         cmap_init(&data->ct_flows);
         cmap_insert(&data->ct_flows,
                     CONST_CAST(struct cmap_node *, &ct_data->node),
@@ -2392,7 +2423,8 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
                              struct nlattr *nl_actions,
                              size_t actions_len,
                              const ovs_u128 *ufid,
-                             struct offload_info *info)
+                             struct offload_info *info,
+                             struct conntrack *conntrack)
 {
     struct flow_patterns patterns = {
         .items = NULL,
@@ -2449,7 +2481,7 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
     }
     flows_data = ufid_to_rte_flow_associate(ufid, netdev, patterns.physdev,
                                             flow, &orig_match, actions_offloaded,
-                                            conntracked, action_handle);
+                                            conntracked, action_handle, conntrack);
     VLOG_DBG("%s/%s: installed flow %p by ufid "UUID_FMT,
              netdev_get_name(netdev), netdev_get_name(patterns.physdev), flow,
              UUID_ARGS((struct uuid *) ufid));
@@ -2555,7 +2587,8 @@ static int
 netdev_offload_dpdk_flow_put(struct netdev *netdev, struct match *match,
                              struct nlattr *actions, size_t actions_len,
                              const ovs_u128 *ufid, struct offload_info *info,
-                             struct dpif_flow_stats *stats)
+                             struct dpif_flow_stats *stats,
+                             struct conntrack *conntrack)
 {
     struct ufid_to_rte_flow_data *rte_flow_data;
     struct dpif_flow_stats old_stats;
@@ -2589,7 +2622,8 @@ netdev_offload_dpdk_flow_put(struct netdev *netdev, struct match *match,
     }
 
     rte_flow_data = netdev_offload_dpdk_add_flow(netdev, match, actions,
-                                                 actions_len, ufid, info);
+                                                 actions_len, ufid, info,
+                                                 conntrack);
     if (!rte_flow_data) {
         return -1;
     }
@@ -2754,6 +2788,7 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
     struct rte_flow_query_count query = { .reset = 1 };
     struct ufid_to_rte_flow_data *rte_flow_data;
     struct rte_flow_error error;
+    const long long now = time_msec();
     int ret = 0;
 
     attrs->dp_extra_info = NULL;
@@ -2796,6 +2831,19 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
                             netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
                             error.message);
                 goto out;
+            }
+            if (!conntrack_check(rte_flow_data->conntrack, &data->conn_key, now, query.hits_set && query.hits)) {
+                ret = netdev_dpdk_rte_flow_destroy(rte_flow_data->physdev, true,
+                                                   data->rte_flow, &error);
+                if (ret) {
+                    VLOG_DBG_RL(&rl, "%s: Failed to destroy ufid "UUID_FMT" CT flow handle: %s",
+                                netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
+                                error.message);
+                    goto out;
+                }
+                data->rte_flow = NULL;
+                cmap_remove(&rte_flow_data->ct_flows, &data->node, data->hash);
+                ovsrcu_postpone(free, data);
             }
         }
         ret = netdev_dpdk_rte_flow_action_handle_query(rte_flow_data->physdev, true,

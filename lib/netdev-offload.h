@@ -42,6 +42,7 @@ struct in6_addr;
 struct smap;
 struct sset;
 struct ovs_action_push_tnl;
+struct conntrack;
 
 
 /* Offload-capable (HW) netdev information */
@@ -110,7 +111,8 @@ bool netdev_flow_dump_next(struct netdev_flow_dump *, struct match *,
                           struct ofpbuf *rbuffer, struct ofpbuf *wbuffer);
 int netdev_flow_put(struct netdev *, struct match *, struct nlattr *actions,
                     size_t actions_len, const ovs_u128 *,
-                    struct offload_info *, struct dpif_flow_stats *);
+                    struct offload_info *, struct dpif_flow_stats *,
+                    struct conntrack *);
 int netdev_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
                        struct flow *flow, struct nlattr *actions,
                        size_t act_len, odp_port_t orig_in_port);

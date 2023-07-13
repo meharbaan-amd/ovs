@@ -2195,7 +2195,8 @@ static int
 netdev_tc_flow_put(struct netdev *netdev, struct match *match,
                    struct nlattr *actions, size_t actions_len,
                    const ovs_u128 *ufid, struct offload_info *info,
-                   struct dpif_flow_stats *stats)
+                   struct dpif_flow_stats *stats,
+                   struct conntrack *conntrack OVS_UNUSED)
 {
     static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 20);
     enum tc_qdisc_hook hook = get_tc_qdisc_hook(netdev);

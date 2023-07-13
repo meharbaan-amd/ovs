@@ -66,7 +66,8 @@ struct netdev_flow_api {
      * Return 0 if successful, otherwise returns a positive errno value. */
     int (*flow_put)(struct netdev *, struct match *, struct nlattr *actions,
                     size_t actions_len, const ovs_u128 *ufid,
-                    struct offload_info *info, struct dpif_flow_stats *);
+                    struct offload_info *info, struct dpif_flow_stats *,
+                    struct conntrack *conntrack);
 
     /* Offload the given flow on netdev.
      * To modify a flow, use the same ufid.

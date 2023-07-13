@@ -309,14 +309,14 @@ int
 netdev_flow_put(struct netdev *netdev, struct match *match,
                 struct nlattr *actions, size_t act_len,
                 const ovs_u128 *ufid, struct offload_info *info,
-                struct dpif_flow_stats *stats)
+                struct dpif_flow_stats *stats, struct conntrack *conntrack)
 {
     const struct netdev_flow_api *flow_api =
         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
 
     return (flow_api && flow_api->flow_put)
            ? flow_api->flow_put(netdev, match, actions, act_len, ufid,
-                                info, stats)
+                                info, stats, conntrack)
            : EOPNOTSUPP;
 }
 

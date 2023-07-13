@@ -64,6 +64,7 @@
 struct dp_packet_batch;
 
 struct conntrack;
+struct conn_key;
 
 union ct_addr {
     ovs_be32 ipv4;
@@ -95,6 +96,8 @@ int conntrack_execute(struct conntrack *ct, struct dp_packet_batch *pkt_batch,
                       ovs_be16 tp_src, ovs_be16 tp_dst, const char *helper,
                       const struct nat_action_info_t *nat_action_info,
                       long long now, uint32_t tp_id);
+bool conntrack_check(struct conntrack *ct, struct conn_key *key, long long now,
+                     bool bump);
 void conntrack_clear(struct dp_packet *packet);
 
 struct conntrack_dump {

@@ -1369,6 +1369,24 @@ conntrack_execute(struct conntrack *ct, struct dp_packet_batch *pkt_batch,
     return 0;
 }
 
+bool
+conntrack_check(struct conntrack *ct, struct conn_key *key, long long now, bool bump)
+{
+    struct conn *conn;
+    bool reply;
+
+    if (conn_lookup(ct, key, now, &conn, &reply)) {
+        if (bump) {
+            ovs_mutex_lock(&conn->lock);
+            conn_update_expiration(ct, conn, conn->tp_timeout, now);
+            ovs_mutex_unlock(&conn->lock);
+        }
+        return true;
+    } else {
+        return false;
+    }
+}
+
 void
 conntrack_clear(struct dp_packet *packet)
 {

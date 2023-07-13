@@ -2303,7 +2303,7 @@ parse_flow_put(struct dpif_netlink *dpif, struct dpif_flow_put *put)
                           CONST_CAST(struct nlattr *, put->actions),
                           put->actions_len,
                           CONST_CAST(ovs_u128 *, put->ufid),
-                          &info, put->stats);
+                          &info, put->stats, NULL);
 
     if (!err) {
         if (put->flags & DPIF_FP_MODIFY) {

@@ -156,6 +156,7 @@ struct conn {
     bool alg_related; /* True if alg data connection. */
 
     uint32_t tp_id; /* Timeout policy ID. */
+    enum ct_timeout tp_timeout;
 };
 
 enum ct_update_res {
