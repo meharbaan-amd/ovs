@@ -126,6 +126,8 @@ PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline1,
         struct ovs_key_ct_tuple_ipv4 ipv4;
         struct ovs_key_ct_tuple_ipv6 ipv6;   /* Used only if                */
     } ct_orig_tuple;                         /* 'ct_orig_tuple_ipv6' is set */
+    bool ct_required;           /* Packet belongs to a flow whose packets must
+                                   go through conntrack. */
 );
 
 PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline2,

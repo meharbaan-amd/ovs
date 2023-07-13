@@ -8466,24 +8466,27 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
 
     add_actions = put_actions->size ? put_actions : actions;
     if (OVS_LIKELY(error != ENOSPC)) {
-        struct dp_netdev_flow *netdev_flow;
+        if (!packet->md.ct_required) {
+            struct dp_netdev_flow *netdev_flow;
 
-        /* XXX: There's a race window where a flow covering this packet
-         * could have already been installed since we last did the flow
-         * lookup before upcall.  This could be solved by moving the
-         * mutex lock outside the loop, but that's an awful long time
-         * to be locking revalidators out of making flow modifications. */
-        ovs_mutex_lock(&pmd->flow_mutex);
-        netdev_flow = dp_netdev_pmd_lookup_flow(pmd, key, NULL);
-        if (OVS_LIKELY(!netdev_flow)) {
-            netdev_flow = dp_netdev_flow_add(pmd, &match, &ufid,
-                                             add_actions->data,
-                                             add_actions->size, orig_in_port);
+            /* XXX: There's a race window where a flow covering this packet
+             * could have already been installed since we last did the flow
+             * lookup before upcall.  This could be solved by moving the
+             * mutex lock outside the loop, but that's an awful long time
+             * to be locking revalidators out of making flow modifications. */
+            ovs_mutex_lock(&pmd->flow_mutex);
+            netdev_flow = dp_netdev_pmd_lookup_flow(pmd, key, NULL);
+            if (OVS_LIKELY(!netdev_flow)) {
+                netdev_flow = dp_netdev_flow_add(pmd, &match, &ufid,
+                                                 add_actions->data,
+                                                 add_actions->size,
+                                                 orig_in_port);
+            }
+            ovs_mutex_unlock(&pmd->flow_mutex);
+            uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
+            smc_insert(pmd, key, hash);
+            emc_probabilistic_insert(pmd, key, netdev_flow);
         }
-        ovs_mutex_unlock(&pmd->flow_mutex);
-        uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
-        smc_insert(pmd, key, hash);
-        emc_probabilistic_insert(pmd, key, netdev_flow);
     }
     if (pmd_perf_metrics_enabled(pmd)) {
         /* Update upcall stats. */

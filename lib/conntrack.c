@@ -583,10 +583,12 @@ write_ct_md(struct dp_packet *pkt, uint16_t zone, const struct conn *conn,
         ovs_mutex_lock(&conn->lock);
         pkt->md.ct_mark = conn->mark;
         pkt->md.ct_label = conn->label;
+        pkt->md.ct_required = conn->alg != NULL;
         ovs_mutex_unlock(&conn->lock);
     } else {
         pkt->md.ct_mark = 0;
         pkt->md.ct_label = OVS_U128_ZERO;
+        pkt->md.ct_required = alg_exp != NULL;
     }
 
     /* Use the original direction tuple if we have it. */
@@ -1180,6 +1182,7 @@ process_one_fast(uint16_t zone, const uint32_t *setmark,
     ovs_mutex_lock(&conn->lock);
     pkt->md.ct_mark = conn->mark;
     pkt->md.ct_label = conn->label;
+    pkt->md.ct_required = conn->alg != NULL;
     ovs_mutex_unlock(&conn->lock);
 
     if (setmark) {
