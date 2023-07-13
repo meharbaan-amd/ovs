@@ -356,6 +356,7 @@ enum dp_offload_type {
 
 enum {
     DP_NETDEV_FLOW_OFFLOAD_OP_ADD,
+    DP_NETDEV_FLOW_OFFLOAD_OP_NOTIFY,
     DP_NETDEV_FLOW_OFFLOAD_OP_MOD,
     DP_NETDEV_FLOW_OFFLOAD_OP_DEL,
 };
@@ -367,6 +368,7 @@ struct dp_offload_flow_item {
     struct nlattr *actions;
     size_t actions_len;
     odp_port_t orig_in_port; /* Originating in_port for tnl flows. */
+    ovs_u128 ufid;
 };
 
 struct dp_offload_flush_item {
@@ -2849,6 +2851,42 @@ err_free:
     return -1;
 }
 
+static int
+dp_netdev_flow_offload_notify(struct dp_offload_thread_item *item)
+{
+    struct dp_offload_flow_item *offload = &item->data->flow;
+    struct dp_netdev *dp = item->dp;
+    struct dp_netdev_flow *flow = offload->flow;
+    odp_port_t in_port = flow->flow.in_port.odp_port;
+    const char *dpif_type_str = dpif_normalize_type(dp->class->type);
+    struct netdev *port;
+    int ret;
+
+    if (flow->dead) {
+        return -1;
+    }
+
+    port = netdev_ports_get(in_port, dpif_type_str);
+    if (!port) {
+        return -1;
+    }
+
+    /* Taking a global 'port_rwlock' to fulfill thread safety
+     * restrictions regarding the netdev port mapping. */
+    ovs_rwlock_rdlock(&dp->port_rwlock);
+    ret = netdev_flow_notify(port, &flow->mega_ufid, &offload->match.flow,
+                             CONST_CAST(struct nlattr *, offload->actions),
+                             offload->actions_len, offload->orig_in_port);
+    ovs_rwlock_unlock(&dp->port_rwlock);
+    netdev_close(port);
+
+    if (ret) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static void
 dp_offload_flow(struct dp_offload_thread_item *item)
 {
@@ -2860,6 +2898,10 @@ dp_offload_flow(struct dp_offload_thread_item *item)
     case DP_NETDEV_FLOW_OFFLOAD_OP_ADD:
         op = "add";
         ret = dp_netdev_flow_offload_put(item);
+        break;
+    case DP_NETDEV_FLOW_OFFLOAD_OP_NOTIFY:
+        op = "notify";
+        ret = dp_netdev_flow_offload_notify(item);
         break;
     case DP_NETDEV_FLOW_OFFLOAD_OP_MOD:
         op = "modify";
@@ -3062,6 +3104,35 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
     memcpy(flow_offload->actions, actions, actions_len);
     flow_offload->actions_len = actions_len;
     flow_offload->orig_in_port = flow->orig_in_port;
+
+    item->timestamp = pmd->ctx.now;
+    dp_netdev_offload_flow_enqueue(item);
+}
+
+static void
+queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
+                         struct dp_netdev_flow *flow,
+                         struct flow *packet_flow,
+                         odp_port_t orig_in_port)
+{
+    struct dp_offload_thread_item *item;
+    struct dp_offload_flow_item *flow_offload;
+    struct dp_netdev_actions *actions;
+
+    if (!netdev_is_flow_api_enabled()) {
+        return;
+    }
+
+    actions = dp_netdev_flow_get_actions(flow);
+
+    item = dp_netdev_alloc_flow_offload(pmd->dp, flow, DP_NETDEV_FLOW_OFFLOAD_OP_NOTIFY);
+    flow_offload = &item->data->flow;
+    flow_offload->match.flow = *packet_flow;
+    flow_offload->actions = xmalloc(actions->size);
+    memcpy(flow_offload->actions, actions->actions, actions->size);
+    flow_offload->actions_len = actions->size;
+    flow_offload->orig_in_port = orig_in_port;
+    flow_offload->ufid = flow->mega_ufid;
 
     item->timestamp = pmd->ctx.now;
     dp_netdev_offload_flow_enqueue(item);
@@ -4154,6 +4225,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     memset(&flow->last_stats, 0, sizeof flow->last_stats);
     memset(&flow->last_attrs, 0, sizeof flow->last_attrs);
     flow->dead = false;
+    flow->notifiable = !!(match->wc.masks.ct_state & CS_ESTABLISHED);
     flow->batch = NULL;
     flow->mark = INVALID_FLOW_MARK;
     flow->orig_in_port = orig_in_port;
@@ -4195,6 +4267,19 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     log_netdev_flow_change(flow, match, NULL, actions, actions_len);
 
     return flow;
+}
+
+static void
+dp_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
+                      struct dp_netdev_flow *flow,
+                      const struct netdev_flow_key *key,
+                      odp_port_t in_port)
+{
+    struct flow packet_flow;
+
+    miniflow_expand(&key->mf, &packet_flow);
+
+    queue_netdev_flow_notify(pmd, flow, &packet_flow, in_port);
 }
 
 static int
@@ -8481,11 +8566,15 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
                                                  add_actions->data,
                                                  add_actions->size,
                                                  orig_in_port);
+            } else if (netdev_flow->notifiable) {
+                dp_netdev_flow_notify(pmd, netdev_flow, key, orig_in_port);
             }
             ovs_mutex_unlock(&pmd->flow_mutex);
-            uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
-            smc_insert(pmd, key, hash);
-            emc_probabilistic_insert(pmd, key, netdev_flow);
+            if (netdev_flow) {
+                uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
+                smc_insert(pmd, key, hash);
+                emc_probabilistic_insert(pmd, key, netdev_flow);
+            }
         }
     }
     if (pmd_perf_metrics_enabled(pmd)) {
@@ -8594,6 +8683,11 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         }
 
         flow = dp_netdev_flow_cast(rules[i]);
+
+        if (flow->notifiable) {
+            dp_netdev_flow_notify(pmd, flow, keys[i], in_port);
+        }
+
         uint32_t hash =  dp_netdev_flow_hash(&flow->ufid);
         smc_insert(pmd, keys[i], hash);
 

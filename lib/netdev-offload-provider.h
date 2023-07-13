@@ -68,6 +68,17 @@ struct netdev_flow_api {
                     size_t actions_len, const ovs_u128 *ufid,
                     struct offload_info *info, struct dpif_flow_stats *);
 
+    /* Offload the given flow on netdev.
+     * To modify a flow, use the same ufid.
+     * 'actions' are in netlink format, as with struct dpif_flow_put.
+     * 'info' is extra info needed to offload the flow.
+     * 'stats' is populated according to the rules set out in the description
+     * above 'struct dpif_flow_put'.
+     * Return 0 if successful, otherwise returns a positive errno value. */
+    int (*flow_notify)(struct netdev *, const ovs_u128 *, const struct flow *,
+                       struct nlattr *actions, size_t actions_len,
+                       odp_port_t orig_in_port);
+
     /* Queries a flow specified by ufid on netdev.
      * Fills output buffer as 'wbuffer' in flow_dump_next, which
      * needs to be be pre allocated.

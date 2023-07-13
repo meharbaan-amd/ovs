@@ -111,6 +111,9 @@ bool netdev_flow_dump_next(struct netdev_flow_dump *, struct match *,
 int netdev_flow_put(struct netdev *, struct match *, struct nlattr *actions,
                     size_t actions_len, const ovs_u128 *,
                     struct offload_info *, struct dpif_flow_stats *);
+int netdev_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+                       struct flow *flow, struct nlattr *actions,
+                       size_t act_len, odp_port_t orig_in_port);
 int netdev_hw_miss_packet_recover(struct netdev *, struct dp_packet *);
 int netdev_flow_get(struct netdev *, struct match *, struct nlattr **actions,
                     const ovs_u128 *, struct dpif_flow_stats *,

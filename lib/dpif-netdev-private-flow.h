@@ -102,6 +102,7 @@ struct dp_netdev_flow {
     struct ovs_refcount ref_cnt;
 
     bool dead;
+    bool notifiable;
     uint32_t mark;               /* Unique flow mark for netdev offloading. */
     uint64_t simple_match_mark;  /* Unique flow mark for the simple match. */
     odp_port_t orig_in_port;
