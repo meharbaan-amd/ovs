@@ -52,6 +52,13 @@ static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(600, 600);
  * For current implementation all above restrictions are fulfilled by
  * read-locking the datapath 'port_rwlock' in lib/dpif-netdev.c.  */
 
+/* Flow data associated with individual CT connections. */
+struct ct_flow_data {
+    struct cmap_node node;
+    struct rte_flow *rte_flow;
+    uint32_t hash;
+};
+
 /*
  * A mapping from ufid to dpdk rte_flow.
  */
@@ -60,13 +67,17 @@ struct ufid_to_rte_flow_data {
     struct cmap_node node;
     ovs_u128 ufid;
     struct netdev *netdev;
+    bool ct;
     struct rte_flow *rte_flow;
+    struct rte_flow_action_handle *rte_flow_action_handle;
     bool actions_offloaded;
     struct dpif_flow_stats stats;
     struct netdev *physdev;
     struct ovs_mutex lock;
     unsigned int creation_tid;
     bool dead;
+    struct cmap ct_flows;
+    struct match match;
 };
 
 struct netdev_offload_dpdk_data {
@@ -210,21 +221,51 @@ ufid_to_rte_flow_data_find_protected(struct netdev *netdev,
     return NULL;
 }
 
+struct ct_tuple {
+    ovs_be32 src_ipv4;
+    ovs_be32 dst_ipv4;
+    struct in6_addr src_ipv6;
+    struct in6_addr dst_ipv6;
+    uint16_t src_port;
+    uint16_t dst_port;
+};
+
+static uint32_t
+hash_ct_tuple(const struct flow *flow)
+{
+    struct ct_tuple tuple;
+
+    tuple.src_ipv4 = flow->nw_src;
+    tuple.dst_ipv4 = flow->nw_dst;
+    tuple.src_ipv6 = flow->ipv6_src;
+    tuple.dst_ipv6 = flow->ipv6_dst;
+    tuple.src_port = flow->tp_src;
+    tuple.dst_port = flow->tp_dst;
+
+    return hash_bytes(&tuple, sizeof tuple, 0);
+}
+
 static inline struct ufid_to_rte_flow_data *
 ufid_to_rte_flow_associate(const ovs_u128 *ufid, struct netdev *netdev,
                            struct netdev *physdev, struct rte_flow *rte_flow,
-                           bool actions_offloaded)
+                           const struct match *match, bool actions_offloaded,
+                           bool conntracked,
+                           struct rte_flow_action_handle *action_handle)
 {
     size_t hash = hash_bytes(ufid, sizeof *ufid, 0);
     struct cmap *map = offload_data_map(netdev);
     struct ufid_to_rte_flow_data *data_prev;
     struct ufid_to_rte_flow_data *data;
+    struct ct_flow_data *ct_data = NULL;
 
     if (!map) {
         return NULL;
     }
 
     data = xzalloc(sizeof *data);
+    if (conntracked) {
+        ct_data = xzalloc(sizeof *ct_data);
+    }
 
     offload_data_lock(netdev);
 
@@ -242,10 +283,22 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid, struct netdev *netdev,
     data->ufid = *ufid;
     data->netdev = netdev_ref(netdev);
     data->physdev = netdev != physdev ? netdev_ref(physdev) : physdev;
-    data->rte_flow = rte_flow;
+    data->rte_flow = conntracked ? NULL : rte_flow;
+    data->rte_flow_action_handle = action_handle;
     data->actions_offloaded = actions_offloaded;
     data->creation_tid = netdev_offload_thread_id();
+    data->ct = conntracked;
+    data->match = *match;
     ovs_mutex_init(&data->lock);
+
+    if (conntracked) {
+        ct_data->rte_flow = rte_flow;
+        ct_data->hash = hash_ct_tuple(&match->flow);
+        cmap_init(&data->ct_flows);
+        cmap_insert(&data->ct_flows,
+                    CONST_CAST(struct cmap_node *, &ct_data->node),
+                    ct_data->hash);
+    }
 
     cmap_insert(map, CONST_CAST(struct cmap_node *, &data->node), hash);
 
@@ -875,6 +928,8 @@ dump_flow_action(struct ds *s, struct ds *s_extra,
             ds_put_format(s, "group %"PRIu32" ", jump->group);
         }
         ds_put_cstr(s, "/ ");
+    } else if (actions->type == RTE_FLOW_ACTION_TYPE_INDIRECT) {
+        ds_put_format(s, "indirect %p / ", actions->conf);
     } else {
         ds_put_format(s, "unknown rte flow action (%d)\n", actions->type);
     }
@@ -1102,7 +1157,8 @@ free_flow_actions(struct flow_actions *actions)
             i += actions->tnl_pmd_actions_cnt - 1;
             continue;
         }
-        if (actions->actions[i].conf) {
+        if (actions->actions[i].conf &&
+            actions->actions[i].type != RTE_FLOW_ACTION_TYPE_INDIRECT) {
             free(CONST_CAST(void *, actions->actions[i].conf));
         }
     }
@@ -1402,7 +1458,8 @@ static int
 parse_flow_match(struct netdev *netdev,
                  odp_port_t orig_in_port OVS_UNUSED,
                  struct flow_patterns *patterns,
-                 struct match *match)
+                 struct match *match,
+                 bool *conntracked)
 {
     struct netdev *physdev = netdev_ports_get(orig_in_port, netdev->dpif_type);
     struct rte_flow_item_ethdev *ethdev_spec = xzalloc(sizeof *ethdev_spec);
@@ -1410,6 +1467,7 @@ parse_flow_match(struct netdev *netdev,
     struct rte_flow_item_eth *eth_spec = NULL, *eth_mask = NULL;
     struct flow *consumed_masks;
     uint8_t proto = 0;
+    bool ct_offload = (match->flow.ct_state & match->wc.masks.ct_state & CS_ESTABLISHED) != 0;
 
     /* Add an explicit traffic source item to the beginning of the pattern. */
     ethdev_spec->port_id = netdev_dpdk_get_port_id(physdev, false);
@@ -1432,7 +1490,7 @@ parse_flow_match(struct netdev *netdev,
 #endif
     memset(&consumed_masks->in_port, 0, sizeof consumed_masks->in_port);
     /* recirc id must be zero. */
-    if (match->wc.masks.recirc_id & match->flow.recirc_id) {
+    if ((match->wc.masks.recirc_id & match->flow.recirc_id) && !ct_offload) {
         return -1;
     }
     consumed_masks->recirc_id = 0;
@@ -1518,6 +1576,12 @@ parse_flow_match(struct netdev *netdev,
         consumed_masks->nw_proto = 0;
         consumed_masks->nw_src = 0;
         consumed_masks->nw_dst = 0;
+
+        if (ct_offload) {
+            mask->hdr.src_addr = UINT32_MAX;
+            mask->hdr.dst_addr = UINT32_MAX;
+            mask->hdr.next_proto_id = UINT8_MAX;
+        }
 
         if (match->wc.masks.nw_frag & FLOW_NW_FRAG_ANY) {
             if (!(match->flow.nw_frag & FLOW_NW_FRAG_ANY)) {
@@ -1652,6 +1716,9 @@ parse_flow_match(struct netdev *netdev,
 
     if (proto == IPPROTO_TCP) {
         struct rte_flow_item_tcp *spec, *mask;
+        const uint8_t tcp_interesting_flags = RTE_TCP_RST_FLAG |
+                                              RTE_TCP_FIN_FLAG |
+                                              RTE_TCP_SYN_FLAG;
 
         spec = xzalloc(sizeof *spec);
         mask = xzalloc(sizeof *mask);
@@ -1665,6 +1732,14 @@ parse_flow_match(struct netdev *netdev,
         mask->hdr.dst_port  = match->wc.masks.tp_dst;
         mask->hdr.data_off  = ntohs(match->wc.masks.tcp_flags) >> 8;
         mask->hdr.tcp_flags = ntohs(match->wc.masks.tcp_flags) & 0xff;
+
+        if ((mask->hdr.tcp_flags & tcp_interesting_flags) == 0 && ct_offload) {
+            mask->hdr.src_port = UINT16_MAX;
+            mask->hdr.dst_port = UINT16_MAX;
+            spec->hdr.tcp_flags &= ~tcp_interesting_flags;
+            mask->hdr.tcp_flags |=  tcp_interesting_flags;
+            consumed_masks->ct_state = 0;
+        }
 
         consumed_masks->tp_src = 0;
         consumed_masks->tp_dst = 0;
@@ -1726,6 +1801,7 @@ parse_flow_match(struct netdev *netdev,
     if (!is_all_zeros(consumed_masks, sizeof *consumed_masks)) {
         return -1;
     }
+    *conntracked = ct_offload;
     return 0;
 }
 
@@ -1824,6 +1900,13 @@ add_represented_port_action(struct flow_actions *actions,
     add_flow_action(actions, RTE_FLOW_ACTION_TYPE_REPRESENTED_PORT, ethdev);
 
     return 0;
+}
+
+static void
+add_indirect_action(struct flow_actions *actions,
+                    const struct rte_flow_action_handle *action_handle)
+{
+    add_flow_action(actions, RTE_FLOW_ACTION_TYPE_INDIRECT, action_handle);
 }
 
 static int
@@ -2274,7 +2357,8 @@ static struct rte_flow *
 netdev_offload_dpdk_actions(struct netdev *netdev,
                             struct flow_patterns *patterns,
                             struct nlattr *nl_actions,
-                            size_t actions_len)
+                            size_t actions_len,
+                            struct rte_flow_action_handle *action_handle)
 {
     const struct rte_flow_attr flow_attr = { .transfer = 1, };
     struct flow_actions actions = {
@@ -2286,10 +2370,15 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
     struct rte_flow_error error;
     int ret;
 
+    if (action_handle) {
+        add_indirect_action(&actions, action_handle);
+    }
+
     ret = parse_flow_actions(netdev, &actions, nl_actions, actions_len);
     if (ret) {
         goto out;
     }
+
     flow = netdev_offload_dpdk_flow_create(netdev, &flow_attr, patterns,
                                            &actions, &error);
 out:
@@ -2312,16 +2401,33 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
     };
     struct ufid_to_rte_flow_data *flows_data = NULL;
     bool actions_offloaded = true;
+    bool conntracked = false;
     struct rte_flow *flow;
+    struct rte_flow_action_handle *action_handle = NULL;
+    struct match orig_match;
 
-    if (parse_flow_match(netdev, info->orig_in_port, &patterns, match)) {
+    orig_match = *match;
+
+    if (parse_flow_match(netdev, info->orig_in_port, &patterns, match,
+                         &conntracked)) {
         VLOG_DBG_RL(&rl, "%s: matches of ufid "UUID_FMT" are not supported",
                     netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid));
         goto out;
     }
 
+    if (conntracked) {
+        action_handle = netdev_dpdk_rte_flow_action_handle_create(patterns.physdev,
+                                                                  true);
+        if (!action_handle) {
+            VLOG_DBG_RL(&rl, "%s: failed to allocate action handle for ufid "UUID_FMT,
+                        netdev_get_name(netdev),
+                        UUID_ARGS((struct uuid *) ufid));
+            goto out;
+        }
+    }
+
     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
-                                       actions_len);
+                                       actions_len, action_handle);
     if (!flow && !netdev_vport_is_vport_class(netdev->netdev_class)) {
         /* If we failed to offload the rule actions fallback to MARK+RSS
          * actions.
@@ -2329,13 +2435,21 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
         flow = netdev_offload_dpdk_mark_rss(&patterns, netdev,
                                             info->flow_mark);
         actions_offloaded = false;
+        conntracked = false;
+
+        if (action_handle) {
+            netdev_dpdk_rte_flow_action_handle_destroy(patterns.physdev, true,
+                                                       action_handle);
+            action_handle = NULL;
+        }
     }
 
     if (!flow) {
         goto out;
     }
     flows_data = ufid_to_rte_flow_associate(ufid, netdev, patterns.physdev,
-                                            flow, actions_offloaded);
+                                            flow, &orig_match, actions_offloaded,
+                                            conntracked, action_handle);
     VLOG_DBG("%s/%s: installed flow %p by ufid "UUID_FMT,
              netdev_get_name(netdev), netdev_get_name(patterns.physdev), flow,
              UUID_ARGS((struct uuid *) ufid));
@@ -2371,7 +2485,25 @@ netdev_offload_dpdk_flow_destroy(struct ufid_to_rte_flow_data *rte_flow_data)
     netdev = rte_flow_data->netdev;
     ufid = &rte_flow_data->ufid;
 
-    ret = netdev_dpdk_rte_flow_destroy(physdev, transfer, rte_flow, &error);
+    if (rte_flow_data->ct) {
+        struct ct_flow_data *data;
+        CMAP_FOR_EACH (data, node, &rte_flow_data->ct_flows) {
+            ret = netdev_dpdk_rte_flow_destroy(physdev, transfer, data->rte_flow, &error);
+            if (ret) {
+                break;
+            }
+            data->rte_flow = NULL;
+            cmap_remove(&rte_flow_data->ct_flows, &data->node, data->hash);
+            ovsrcu_postpone(free, data);
+        }
+        if (!ret) {
+            cmap_destroy(&rte_flow_data->ct_flows);
+            ret = netdev_dpdk_rte_flow_action_handle_destroy(physdev, transfer,
+                                        rte_flow_data->rte_flow_action_handle);
+        }
+    } else {
+        ret = netdev_dpdk_rte_flow_destroy(physdev, transfer, rte_flow, &error);
+    }
 
     if (ret == 0) {
         struct netdev_offload_dpdk_data *data;
@@ -2470,6 +2602,101 @@ netdev_offload_dpdk_flow_put(struct netdev *netdev, struct match *match,
     return 0;
 }
 
+static struct rte_flow *
+netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
+                                struct match *match,
+                                struct nlattr *nl_actions,
+                                size_t actions_len,
+                                odp_port_t orig_in_port,
+                                struct rte_flow_action_handle *action_handle)
+{
+    struct flow_patterns patterns = {
+        .items = NULL,
+        .cnt = 0,
+        .s_tnl = DS_EMPTY_INITIALIZER,
+    };
+    bool conntracked = false;
+    struct rte_flow *flow = NULL;
+
+    if (parse_flow_match(netdev, orig_in_port, &patterns, match, &conntracked)) {
+        VLOG_ERR("%s: matches of notified flow are not supported",
+                    netdev_get_name(netdev));
+        goto out;
+    }
+
+    if (!conntracked) {
+        VLOG_ERR("%s: matches of notified flow are not conntracked",
+                    netdev_get_name(netdev));
+        goto out;
+    }
+
+    flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
+                                       actions_len, action_handle);
+    if (!flow) {
+        VLOG_ERR("%s: failed to offload notified flow",
+                    netdev_get_name(netdev));
+        goto out;
+    }
+
+out:
+    free_flow_patterns(&patterns);
+    return flow;
+}
+
+static int
+netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+                                const struct flow *packet_flow,
+                                struct nlattr *actions, size_t actions_len,
+                                odp_port_t orig_in_port)
+{
+    struct ufid_to_rte_flow_data *rte_flow_data;
+    struct rte_flow *rte_flow;
+    struct ct_flow_data *ct_data;
+    struct match match;
+    uint32_t hash;
+
+    rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
+    if (OVS_LIKELY(rte_flow_data)) {
+        if (!rte_flow_data->ct) {
+            VLOG_ERR("Pinged flow is not CT");
+            return EINVAL;
+        }
+        if (!rte_flow_data->rte_flow_action_handle) {
+            VLOG_ERR("Pinged flow does not provide an action handle");
+            return EINVAL;
+        }
+
+        hash = hash_ct_tuple(packet_flow);
+
+        ovs_mutex_lock(&rte_flow_data->lock);
+        if (cmap_find(&rte_flow_data->ct_flows, hash) == NULL)
+        {
+            match = rte_flow_data->match;
+            match.flow = *packet_flow;
+
+            rte_flow = netdev_offload_dpdk_add_ct_flow(netdev, &match, actions,
+                                                       actions_len, orig_in_port,
+                                                       rte_flow_data->rte_flow_action_handle);
+            if (!rte_flow) {
+                ovs_mutex_unlock(&rte_flow_data->lock);
+                return EFAULT;
+            }
+
+            ct_data = xzalloc(sizeof *ct_data);
+            ct_data->rte_flow = rte_flow;
+            ct_data->hash = hash;
+
+            cmap_insert(&rte_flow_data->ct_flows,
+                        CONST_CAST(struct cmap_node *, &ct_data->node), hash);
+        }
+        ovs_mutex_unlock(&rte_flow_data->lock);
+    } else {
+        VLOG_ERR("Pinged flow not found");
+    }
+
+    return 0;
+}
+
 static int
 netdev_offload_dpdk_flow_del(struct netdev *netdev OVS_UNUSED,
                              const ovs_u128 *ufid,
@@ -2478,7 +2705,7 @@ netdev_offload_dpdk_flow_del(struct netdev *netdev OVS_UNUSED,
     struct ufid_to_rte_flow_data *rte_flow_data;
 
     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, true);
-    if (!rte_flow_data || !rte_flow_data->rte_flow) {
+    if (!rte_flow_data || (!rte_flow_data->rte_flow && !rte_flow_data->ct)) {
         return -1;
     }
 
@@ -2532,7 +2759,7 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
     attrs->dp_extra_info = NULL;
 
     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
-    if (!rte_flow_data || !rte_flow_data->rte_flow ||
+    if (!rte_flow_data || (!rte_flow_data->rte_flow && !rte_flow_data->ct) ||
         rte_flow_data->dead || ovs_mutex_trylock(&rte_flow_data->lock)) {
         return -1;
     }
@@ -2553,14 +2780,43 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
         goto out;
     }
     attrs->dp_layer = "dpdk";
-    ret = netdev_dpdk_rte_flow_query_count(rte_flow_data->physdev,
-                                           rte_flow_data->rte_flow, &query,
-                                           &error);
-    if (ret) {
-        VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" flow: %p",
-                    netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
-                    rte_flow_data->rte_flow);
-        goto out;
+    if (rte_flow_data->ct) {
+        struct ct_flow_data *data;
+        CMAP_FOR_EACH (data, node, &rte_flow_data->ct_flows) {
+            if (!data->rte_flow) {
+                continue;
+            }
+
+            query = (struct rte_flow_query_count) { .reset = 1 };
+            ret = netdev_dpdk_rte_flow_query_count(rte_flow_data->physdev,
+                                                   data->rte_flow, &query,
+                                                   &error);
+            if (ret) {
+                VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" CT flow handle: %s",
+                            netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
+                            error.message);
+                goto out;
+            }
+        }
+        ret = netdev_dpdk_rte_flow_action_handle_query(rte_flow_data->physdev, true,
+                                                 rte_flow_data->rte_flow_action_handle,
+                                                 &query, &error);
+        if (ret) {
+            VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" flow action handle: %p",
+                        netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
+                        rte_flow_data->rte_flow_action_handle);
+            goto out;
+        }
+    } else {
+        ret = netdev_dpdk_rte_flow_query_count(rte_flow_data->physdev,
+                                               rte_flow_data->rte_flow, &query,
+                                               &error);
+        if (ret) {
+            VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" flow: %p",
+                        netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
+                        rte_flow_data->rte_flow);
+            goto out;
+        }
     }
     rte_flow_data->stats.n_packets += (query.hits_set) ? query.hits : 0;
     rte_flow_data->stats.n_bytes += (query.bytes_set) ? query.bytes : 0;
@@ -2773,6 +3029,7 @@ netdev_offload_dpdk_get_n_flows(struct netdev *netdev,
 const struct netdev_flow_api netdev_offload_dpdk = {
     .type = "dpdk_flow_api",
     .flow_put = netdev_offload_dpdk_flow_put,
+    .flow_notify = netdev_offload_dpdk_flow_notify,
     .flow_del = netdev_offload_dpdk_flow_del,
     .init_flow_api = netdev_offload_dpdk_init_flow_api,
     .uninit_flow_api = netdev_offload_dpdk_uninit_flow_api,
