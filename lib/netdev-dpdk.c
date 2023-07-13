@@ -6334,6 +6334,82 @@ netdev_dpdk_rte_flow_tunnel_item_release(struct netdev *netdev,
     return ret;
 }
 
+struct rte_flow_action_handle *
+netdev_dpdk_rte_flow_action_handle_create(struct netdev *netdev, bool transfer)
+{
+    struct netdev_dpdk *dev;
+    uint16_t port_id;
+
+    static const struct rte_flow_indir_action_conf conf = { .transfer = 1, };
+    static const struct rte_flow_action_count count = { .id = 0, };
+    static const struct rte_flow_action action = {
+        .type = RTE_FLOW_ACTION_TYPE_COUNT,
+        .conf = &count,
+    };
+
+    struct rte_flow_action_handle *action_handle;
+    struct rte_flow_error error;
+
+    if (!is_dpdk_class(netdev->netdev_class)) {
+        return NULL;
+    }
+
+    dev = netdev_dpdk_cast(netdev);
+    port_id = transfer ? dev->flow_transfer_proxy_port_id : dev->port_id;
+
+    action_handle = rte_flow_action_handle_create(port_id, &conf, &action,
+                                                  &error);
+    if (!action_handle) {
+        VLOG_ERR("Failed to allocate action handle: %s", error.message);
+    }
+
+    return action_handle;
+}
+
+int
+netdev_dpdk_rte_flow_action_handle_query(struct netdev *netdev, bool transfer,
+                                         const struct rte_flow_action_handle *handle,
+                                         void *data,
+                                         struct rte_flow_error *error)
+{
+    struct netdev_dpdk *dev;
+    uint16_t port_id;
+
+    if (!is_dpdk_class(netdev->netdev_class)) {
+        return -1;
+    }
+
+    dev = netdev_dpdk_cast(netdev);
+    port_id = transfer ? dev->flow_transfer_proxy_port_id : dev->port_id;
+
+    return rte_flow_action_handle_query(port_id, handle, data, error);
+}
+
+int
+netdev_dpdk_rte_flow_action_handle_destroy(struct netdev *netdev,
+                                           bool transfer,
+                                           struct rte_flow_action_handle *action_handle)
+{
+    struct netdev_dpdk *dev;
+    uint16_t port_id;
+    struct rte_flow_error error;
+    int ret;
+
+    if (!is_dpdk_class(netdev->netdev_class)) {
+        return -1;
+    }
+
+    dev = netdev_dpdk_cast(netdev);
+    port_id = transfer ? dev->flow_transfer_proxy_port_id : dev->port_id;
+
+    ret = rte_flow_action_handle_destroy(port_id, action_handle, &error);
+    if (ret != 0) {
+        VLOG_ERR("Failed to destroy action handle: %s", error.message);
+    }
+
+    return ret;
+}
+
 #endif /* ALLOW_EXPERIMENTAL_API */
 
 static void

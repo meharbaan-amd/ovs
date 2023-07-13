@@ -88,6 +88,19 @@ int netdev_dpdk_rte_flow_tunnel_item_release(struct netdev *,
                                              uint32_t num_of_items,
                                              struct rte_flow_error *);
 
+struct rte_flow_action_handle *
+netdev_dpdk_rte_flow_action_handle_create(struct netdev *netdev, bool transfer);
+
+int
+netdev_dpdk_rte_flow_action_handle_query(struct netdev *netdev, bool transfer,
+                                         const struct rte_flow_action_handle *handle,
+                                         void *data,
+                                         struct rte_flow_error *error);
+
+int
+netdev_dpdk_rte_flow_action_handle_destroy(struct netdev *netdev, bool transfer,
+                                         struct rte_flow_action_handle *action_handle);
+
 #else
 
 static inline int
@@ -143,6 +156,32 @@ netdev_dpdk_rte_flow_tunnel_item_release(
     struct rte_flow_error *error)
 {
     set_error(error, RTE_FLOW_ERROR_TYPE_NONE);
+    return 0;
+}
+
+static inline struct rte_flow_action_handle *
+netdev_dpdk_rte_flow_action_handle_create(struct netdev *netdev OVS_UNUSED,
+                                          bool transfer OVS_UNUSED)
+{
+    return NULL;
+}
+
+static inline int
+netdev_dpdk_rte_flow_action_handle_query(struct netdev *netdev OVS_UNUSED,
+                                         bool transfer OVS_UNUSED,
+                                         const struct rte_flow_action_handle *handle OVS_UNUSED,
+                                         void *data OVS_UNUSED,
+                                         struct rte_flow_error *error)
+{
+    set_error(error, RTE_FLOW_ERROR_TYPE_ACTION);
+    return -1;
+}
+
+static inline int
+netdev_dpdk_rte_flow_action_handle_destroy(struct netdev *netdev OVS_UNUSED,
+                                           bool transfer OVS_UNUSED,
+                                           struct rte_flow_action_handle *action_handle OVS_UNUSED)
+{
     return 0;
 }
 
