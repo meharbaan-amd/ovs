@@ -322,15 +322,17 @@ netdev_flow_put(struct netdev *netdev, struct match *match,
 
 int
 netdev_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
-                   struct flow *flow, struct nlattr *actions, size_t act_len,
+                   struct flow *flow,
+                   const struct pkt_metadata_nat *pre_nat_tuple,
+                   struct nlattr *actions, size_t act_len,
                    odp_port_t orig_in_port)
 {
     const struct netdev_flow_api *flow_api =
         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
 
     return (flow_api && flow_api->flow_notify)
-           ? flow_api->flow_notify(netdev, ufid, flow, actions, act_len,
-                                   orig_in_port)
+           ? flow_api->flow_notify(netdev, ufid, flow, pre_nat_tuple,
+                                   actions, act_len, orig_in_port)
            : EOPNOTSUPP;
 }
 

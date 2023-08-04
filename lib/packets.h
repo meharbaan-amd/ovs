@@ -99,6 +99,15 @@ flow_tnl_equal(const struct flow_tnl *a, const struct flow_tnl *b)
     return a_size == flow_tnl_size(b) && !memcmp(a, b, a_size);
 }
 
+struct pkt_metadata_nat {
+    union {
+        ovs_be32 ipv4;
+        ovs_be32 ipv6[4];
+    };
+    ovs_be16 src_port;
+    ovs_be16 dst_port;
+};
+
 /* Datapath packet metadata */
 struct pkt_metadata {
 PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline0,
@@ -128,6 +137,8 @@ PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline1,
     } ct_orig_tuple;                         /* 'ct_orig_tuple_ipv6' is set */
     bool ct_required;           /* Packet belongs to a flow whose packets must
                                    go through conntrack. */
+    struct pkt_metadata_nat ct_pre_nat_tuple; /* Populated only for non-zero
+                                                 'ct_state'. */
 );
 
 PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline2,

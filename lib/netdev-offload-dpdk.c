@@ -1490,6 +1490,7 @@ parse_flow_match(struct netdev *netdev,
                  odp_port_t orig_in_port OVS_UNUSED,
                  struct flow_patterns *patterns,
                  struct match *match,
+                 const struct pkt_metadata_nat *pre_nat_tuple,
                  bool *conntracked)
 {
     struct netdev *physdev = netdev_ports_get(orig_in_port, netdev->dpif_type);
@@ -1612,6 +1613,11 @@ parse_flow_match(struct netdev *netdev,
             mask->hdr.src_addr = UINT32_MAX;
             mask->hdr.dst_addr = UINT32_MAX;
             mask->hdr.next_proto_id = UINT8_MAX;
+            if (match->flow.ct_state & CS_SRC_NAT) {
+                spec->hdr.src_addr = pre_nat_tuple->ipv4;
+            } else if (match->flow.ct_state & CS_DST_NAT) {
+                spec->hdr.dst_addr = pre_nat_tuple->ipv4;
+            }
         }
 
         if (match->wc.masks.nw_frag & FLOW_NW_FRAG_ANY) {
@@ -1679,6 +1685,19 @@ parse_flow_match(struct netdev *netdev,
                sizeof mask->hdr.src_addr);
         memcpy(mask->hdr.dst_addr, &match->wc.masks.ipv6_dst,
                sizeof mask->hdr.dst_addr);
+
+        if (ct_offload) {
+            memset(mask->hdr.src_addr, 0xff, sizeof mask->hdr.src_addr);
+            memset(mask->hdr.dst_addr, 0xff, sizeof mask->hdr.dst_addr);
+            mask->hdr.proto = UINT8_MAX;
+            if (match->flow.ct_state & CS_SRC_NAT) {
+                memcpy(spec->hdr.src_addr, &pre_nat_tuple->ipv6,
+                       sizeof spec->hdr.src_addr);
+            } else if (match->flow.ct_state & CS_DST_NAT) {
+                memcpy(spec->hdr.dst_addr, &pre_nat_tuple->ipv6,
+                       sizeof spec->hdr.dst_addr);
+            }
+        }
 
         consumed_masks->nw_ttl = 0;
         consumed_masks->nw_tos = 0;
@@ -1769,6 +1788,10 @@ parse_flow_match(struct netdev *netdev,
             mask->hdr.dst_port = UINT16_MAX;
             spec->hdr.tcp_flags &= ~tcp_interesting_flags;
             mask->hdr.tcp_flags |=  tcp_interesting_flags;
+            if (match->flow.ct_state & (CS_SRC_NAT | CS_DST_NAT)) {
+                spec->hdr.src_port = pre_nat_tuple->src_port;
+                spec->hdr.dst_port = pre_nat_tuple->dst_port;
+            }
             consumed_masks->ct_state = 0;
         }
 
@@ -2389,7 +2412,9 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
                             struct flow_patterns *patterns,
                             struct nlattr *nl_actions,
                             size_t actions_len,
-                            struct rte_flow_action_handle *action_handle)
+                            struct rte_flow_action_handle *action_handle,
+                            const struct match *match,
+                            const struct pkt_metadata_nat *pre_nat_tuple)
 {
     const struct rte_flow_attr flow_attr = { .transfer = 1, };
     struct flow_actions actions = {
@@ -2403,6 +2428,49 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
 
     if (action_handle) {
         add_indirect_action(&actions, action_handle);
+    }
+
+    if (match->flow.ct_state & (CS_SRC_NAT | CS_DST_NAT)) {
+        bool ipv4 = ntohs(match->flow.dl_type) == ETH_TYPE_IP;
+        bool snat = (match->flow.ct_state & CS_SRC_NAT) == CS_SRC_NAT;
+
+        // TODO add and use ip_set flag in pkt_metadata_nat
+        if (ipv4) {
+            struct rte_flow_action_set_ipv4 *set_ipv4;
+
+            set_ipv4 = xzalloc(sizeof *set_ipv4);
+            if (snat) {
+                set_ipv4->ipv4_addr = match->flow.nw_src;
+                add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_SET_IPV4_SRC,
+                                set_ipv4);
+            } else {
+                set_ipv4->ipv4_addr = match->flow.nw_dst;
+                add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_SET_IPV4_DST,
+                                set_ipv4);
+            }
+        } else {
+            struct rte_flow_action_set_ipv6 *set_ipv6;
+
+            set_ipv6 = xzalloc(sizeof *set_ipv6);
+            if (snat) {
+                memcpy(set_ipv6->ipv6_addr, &match->flow.ipv6_src,
+                       sizeof set_ipv6->ipv6_addr);
+                add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_SET_IPV6_SRC,
+                                set_ipv6);
+            } else {
+                memcpy(set_ipv6->ipv6_addr, &match->flow.ipv6_dst,
+                       sizeof set_ipv6->ipv6_addr);
+                add_flow_action(&actions, RTE_FLOW_ACTION_TYPE_SET_IPV6_DST,
+                                set_ipv6);
+            }
+        }
+
+        struct rte_flow_action_set_tp *set_port;
+        set_port = xzalloc(sizeof *set_port);
+        set_port->port = snat ? match->flow.tp_src : match->flow.tp_dst;
+        add_flow_action(&actions,
+                        snat ? RTE_FLOW_ACTION_TYPE_SET_TP_SRC :
+                               RTE_FLOW_ACTION_TYPE_SET_TP_DST, set_port);
     }
 
     ret = parse_flow_actions(netdev, &actions, nl_actions, actions_len);
@@ -2441,7 +2509,7 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
     orig_match = *match;
 
     if (parse_flow_match(netdev, info->orig_in_port, &patterns, match,
-                         &conntracked)) {
+                         info->pre_nat_tuple, &conntracked)) {
         VLOG_DBG_RL(&rl, "%s: matches of ufid "UUID_FMT" are not supported",
                     netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid));
         goto out;
@@ -2459,7 +2527,8 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
     }
 
     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
-                                       actions_len, action_handle);
+                                       actions_len, action_handle, &orig_match,
+                                       info->pre_nat_tuple);
     if (!flow && !netdev_vport_is_vport_class(netdev->netdev_class)) {
         /* If we failed to offload the rule actions fallback to MARK+RSS
          * actions.
@@ -2639,6 +2708,7 @@ netdev_offload_dpdk_flow_put(struct netdev *netdev, struct match *match,
 static struct rte_flow *
 netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
                                 struct match *match,
+                                const struct pkt_metadata_nat *pre_nat_tuple,
                                 struct nlattr *nl_actions,
                                 size_t actions_len,
                                 odp_port_t orig_in_port,
@@ -2652,7 +2722,8 @@ netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
     bool conntracked = false;
     struct rte_flow *flow = NULL;
 
-    if (parse_flow_match(netdev, orig_in_port, &patterns, match, &conntracked)) {
+    if (parse_flow_match(netdev, orig_in_port, &patterns, match, pre_nat_tuple,
+                         &conntracked)) {
         VLOG_ERR("%s: matches of notified flow are not supported",
                     netdev_get_name(netdev));
         goto out;
@@ -2665,7 +2736,8 @@ netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
     }
 
     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
-                                       actions_len, action_handle);
+                                       actions_len, action_handle, match,
+                                       pre_nat_tuple);
     if (!flow) {
         VLOG_ERR("%s: failed to offload notified flow",
                     netdev_get_name(netdev));
@@ -2680,6 +2752,7 @@ out:
 static int
 netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
                                 const struct flow *packet_flow,
+                                const struct pkt_metadata_nat *pre_nat_tuple,
                                 struct nlattr *actions, size_t actions_len,
                                 odp_port_t orig_in_port)
 {
@@ -2708,7 +2781,8 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             match = rte_flow_data->match;
             match.flow = *packet_flow;
 
-            rte_flow = netdev_offload_dpdk_add_ct_flow(netdev, &match, actions,
+            rte_flow = netdev_offload_dpdk_add_ct_flow(netdev, &match,
+                                                       pre_nat_tuple, actions,
                                                        actions_len, orig_in_port,
                                                        rte_flow_data->rte_flow_action_handle);
             if (!rte_flow) {

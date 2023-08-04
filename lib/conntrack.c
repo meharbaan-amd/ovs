@@ -720,8 +720,16 @@ static void
 pat_packet(struct dp_packet *pkt, const struct conn_key *key)
 {
     if (key->nw_proto == IPPROTO_TCP) {
+        struct tcp_header *th = dp_packet_l4(pkt);
+        pkt->md.ct_pre_nat_tuple.src_port = th->tcp_src;
+        pkt->md.ct_pre_nat_tuple.dst_port = th->tcp_dst;
+
         packet_set_tcp_port(pkt, key->dst.port, key->src.port);
     } else if (key->nw_proto == IPPROTO_UDP) {
+        struct udp_header *uh = dp_packet_l4(pkt);
+        pkt->md.ct_pre_nat_tuple.src_port = uh->udp_src;
+        pkt->md.ct_pre_nat_tuple.dst_port = uh->udp_dst;
+
         packet_set_udp_port(pkt, key->dst.port, key->src.port);
     } else if (key->nw_proto == IPPROTO_SCTP) {
         packet_set_sctp_port(pkt, key->dst.port, key->src.port);
@@ -748,8 +756,12 @@ nat_packet_ipv4(struct dp_packet *pkt, const struct conn_key *key,
     struct ip_header *nh = dp_packet_l3(pkt);
 
     if (nat_action & NAT_ACTION_SRC) {
+        memcpy(&pkt->md.ct_pre_nat_tuple.ipv4, &nh->ip_src,
+               sizeof pkt->md.ct_pre_nat_tuple.ipv4);
         packet_set_ipv4_addr(pkt, &nh->ip_src, key->dst.addr.ipv4);
     } else if (nat_action & NAT_ACTION_DST) {
+        memcpy(&pkt->md.ct_pre_nat_tuple.ipv4, &nh->ip_dst,
+               sizeof pkt->md.ct_pre_nat_tuple.ipv4);
         packet_set_ipv4_addr(pkt, &nh->ip_dst, key->src.addr.ipv4);
     }
 }
@@ -761,9 +773,13 @@ nat_packet_ipv6(struct dp_packet *pkt, const struct conn_key *key,
     struct ovs_16aligned_ip6_hdr *nh6 = dp_packet_l3(pkt);
 
     if (nat_action & NAT_ACTION_SRC) {
+        memcpy(&pkt->md.ct_pre_nat_tuple.ipv6, &nh6->ip6_src.be32,
+               sizeof nh6->ip6_src.be32);
         packet_set_ipv6_addr(pkt, key->nw_proto, nh6->ip6_src.be32,
                              &key->dst.addr.ipv6, true);
     } else if (nat_action & NAT_ACTION_DST) {
+        memcpy(&pkt->md.ct_pre_nat_tuple.ipv6, &nh6->ip6_dst.be32,
+               sizeof nh6->ip6_src.be32);
         packet_set_ipv6_addr(pkt, key->nw_proto, nh6->ip6_dst.be32,
                              &key->src.addr.ipv6, true);
     }

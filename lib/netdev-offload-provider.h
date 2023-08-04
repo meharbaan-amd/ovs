@@ -77,8 +77,8 @@ struct netdev_flow_api {
      * above 'struct dpif_flow_put'.
      * Return 0 if successful, otherwise returns a positive errno value. */
     int (*flow_notify)(struct netdev *, const ovs_u128 *, const struct flow *,
-                       struct nlattr *actions, size_t actions_len,
-                       odp_port_t orig_in_port);
+                       const struct pkt_metadata_nat *, struct nlattr *actions,
+                       size_t actions_len, odp_port_t orig_in_port);
 
     /* Queries a flow specified by ufid on netdev.
      * Fills output buffer as 'wbuffer' in flow_dump_next, which
