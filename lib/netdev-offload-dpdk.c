@@ -2414,7 +2414,7 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
                             size_t actions_len,
                             struct rte_flow_action_handle *action_handle,
                             const struct match *match,
-                            const struct pkt_metadata_nat *pre_nat_tuple)
+                            const struct pkt_metadata_nat *pre_nat_tuple __rte_unused)
 {
     const struct rte_flow_attr flow_attr = { .transfer = 1, };
     struct flow_actions actions = {
@@ -2514,7 +2514,6 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
                     netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid));
         goto out;
     }
-
     if (conntracked) {
         action_handle = netdev_dpdk_rte_flow_action_handle_create(patterns.physdev,
                                                                   true);
@@ -2522,10 +2521,9 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
             VLOG_DBG_RL(&rl, "%s: failed to allocate action handle for ufid "UUID_FMT,
                         netdev_get_name(netdev),
                         UUID_ARGS((struct uuid *) ufid));
-            goto out;
+            // goto out;
         }
     }
-
     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
                                        actions_len, action_handle, &orig_match,
                                        info->pre_nat_tuple);
@@ -2599,8 +2597,11 @@ netdev_offload_dpdk_flow_destroy(struct ufid_to_rte_flow_data *rte_flow_data)
         }
         if (!ret) {
             cmap_destroy(&rte_flow_data->ct_flows);
-            ret = netdev_dpdk_rte_flow_action_handle_destroy(physdev, transfer,
-                                        rte_flow_data->rte_flow_action_handle);
+            if(rte_flow_data->rte_flow_action_handle)
+            {
+                ret = netdev_dpdk_rte_flow_action_handle_destroy(physdev, transfer,
+                                            rte_flow_data->rte_flow_action_handle);
+            }
         }
     } else {
         ret = netdev_dpdk_rte_flow_destroy(physdev, transfer, rte_flow, &error);
@@ -2768,11 +2769,12 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             VLOG_ERR("Pinged flow is not CT");
             return EINVAL;
         }
+#if 0
         if (!rte_flow_data->rte_flow_action_handle) {
             VLOG_ERR("Pinged flow does not provide an action handle");
             return EINVAL;
         }
-
+#endif
         hash = hash_ct_tuple(packet_flow);
 
         ovs_mutex_lock(&rte_flow_data->lock);
@@ -2919,16 +2921,19 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
                 cmap_remove(&rte_flow_data->ct_flows, &data->node, data->hash);
                 ovsrcu_postpone(free, data);
             }
-        }
-        ret = netdev_dpdk_rte_flow_action_handle_query(rte_flow_data->physdev, true,
-                                                 rte_flow_data->rte_flow_action_handle,
-                                                 &query, &error);
-        if (ret) {
-            VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" flow action handle: %p",
-                        netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
-                        rte_flow_data->rte_flow_action_handle);
-            goto out;
-        }
+       }
+       if(rte_flow_data->rte_flow_action_handle)
+       {
+           ret = netdev_dpdk_rte_flow_action_handle_query(rte_flow_data->physdev, true,
+                                                    rte_flow_data->rte_flow_action_handle,
+                                                    &query, &error);
+           if (ret) {
+               VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" flow action handle: %p",
+                          netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
+                          rte_flow_data->rte_flow_action_handle);
+               goto out;
+           }
+       }
     } else {
         ret = netdev_dpdk_rte_flow_query_count(rte_flow_data->physdev,
                                                rte_flow_data->rte_flow, &query,
