@@ -2795,6 +2795,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             ct_data = xzalloc(sizeof *ct_data);
             ct_data->rte_flow = rte_flow;
             ct_data->hash = hash;
+            conn_key_extract_from_flow(&match.flow, &ct_data->conn_key);
 
             cmap_insert(&rte_flow_data->ct_flows,
                         CONST_CAST(struct cmap_node *, &ct_data->node), hash);
