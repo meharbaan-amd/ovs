@@ -1994,6 +1994,15 @@ netdev_dpdk_get_port_by_mac(const char *mac_str)
     return DPDK_ETH_PORT_ID_INVALID;
 }
 
+static char *find_representor_name(const char * devargs)
+{
+    char *p = NULL;
+    p = strstr(devargs,"representor=");
+    if(p)
+        p += strlen("representor=");
+    return p;
+}
+
 /* Return the first DPDK port id matching the devargs pattern. */
 static dpdk_port_t netdev_dpdk_get_port_by_devargs(const char *devargs)
     OVS_REQUIRES(dpdk_mutex)
@@ -2027,17 +2036,21 @@ netdev_dpdk_process_devargs(struct netdev_dpdk *dev,
     OVS_REQUIRES(dpdk_mutex)
 {
     dpdk_port_t new_port_id;
+    char new_devargs[32];
+    char *devargs_new = find_representor_name(devargs);
+    if(devargs_new)
+        sprintf(new_devargs,"vdev=net_ionic_%s",devargs_new);
 
     if (strncmp(devargs, "class=eth,mac=", 14) == 0) {
         new_port_id = netdev_dpdk_get_port_by_mac(&devargs[14]);
     } else {
-        new_port_id = netdev_dpdk_get_port_by_devargs(devargs);
+        new_port_id = devargs_new ? netdev_dpdk_get_port_by_devargs(new_devargs): netdev_dpdk_get_port_by_devargs(devargs);
         if (!rte_eth_dev_is_valid_port(new_port_id)) {
             /* Device not found in DPDK, attempt to attach it */
             if (rte_dev_probe(devargs)) {
                 new_port_id = DPDK_ETH_PORT_ID_INVALID;
             } else {
-                new_port_id = netdev_dpdk_get_port_by_devargs(devargs);
+                new_port_id = devargs_new ? netdev_dpdk_get_port_by_devargs(new_devargs): netdev_dpdk_get_port_by_devargs(devargs);
                 if (rte_eth_dev_is_valid_port(new_port_id)) {
                     /* Attach successful */
                     dev->attached = true;
@@ -4292,10 +4305,15 @@ netdev_dpdk_detach(struct unixctl_conn *conn, int argc OVS_UNUSED,
     dpdk_port_t port_id;
     bool used = false;
     char *response;
+    char new_devargs[32];
 
     ovs_mutex_lock(&dpdk_mutex);
 
-    port_id = netdev_dpdk_get_port_by_devargs(argv[1]);
+    char *devargs_new = find_representor_name(argv[1]);
+    if(devargs_new)
+        sprintf(new_devargs,"vdev=net_ionic_%s",devargs_new);
+
+    port_id = devargs_new ? netdev_dpdk_get_port_by_devargs(new_devargs):netdev_dpdk_get_port_by_devargs(argv[1]);
     if (!rte_eth_dev_is_valid_port(port_id)) {
         response = xasprintf("Device '%s' not found in DPDK", argv[1]);
         goto error;
