@@ -389,7 +389,6 @@ AC_DEFUN([OVS_CHECK_DPDK], [
               ;;
             1)
               AC_MSG_RESULT([yes])
-              AC_MSG_ERROR([Please upgrade pkg-config])
               ;;
             *)
               AC_MSG_ERROR([grep exited with status $status])
