@@ -1089,6 +1089,10 @@ dpdk_eth_dev_port_config(struct netdev_dpdk *dev, int n_rxq, int n_txq)
 
     rte_eth_dev_info_get(dev->port_id, &info);
 
+    VLOG_WARN("Enabling RTE_ETH_RX_OFFLOAD_SCATTER & RTE_ETH_TX_OFFLOAD_MULTI_SEGS");
+    conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_SCATTER;
+    conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+
     /* As of DPDK 17.11.1 a few PMDs require to explicitly enable
      * scatter to support jumbo RX.
      * Setting scatter for the device is done after checking for
