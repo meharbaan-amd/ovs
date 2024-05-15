@@ -3122,7 +3122,7 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
                          struct dp_netdev_flow *flow,
                          const struct pkt_metadata_nat *pre_nat_tuple,
                          struct flow *packet_flow,
-                         odp_port_t orig_in_port)
+                         odp_port_t orig_in_port OVS_UNUSED)
 {
     struct dp_offload_thread_item *item;
     struct dp_offload_flow_item *flow_offload;
@@ -3140,7 +3140,8 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     flow_offload->actions = xmalloc(actions->size);
     memcpy(flow_offload->actions, actions->actions, actions->size);
     flow_offload->actions_len = actions->size;
-    flow_offload->orig_in_port = orig_in_port;
+    //FIXME This has been added for vxlan11/dpdk0 means encap-netdev/orig-netdev
+    flow_offload->orig_in_port = flow->orig_in_port;
     flow_offload->pre_nat_tuple = *pre_nat_tuple;
     flow_offload->ufid = flow->mega_ufid;
 

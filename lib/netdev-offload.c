@@ -313,6 +313,10 @@ netdev_flow_put(struct netdev *netdev, struct match *match,
 {
     const struct netdev_flow_api *flow_api =
         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
+    if(netdev_vport_is_vport_class(netdev->netdev_class))
+            VLOG_ERR("SASA For nedev %s flow apu is %p ", netdev->name, flow_api);
+       
+       
 
     return (flow_api && flow_api->flow_put)
            ? flow_api->flow_put(netdev, match, actions, act_len, ufid,
