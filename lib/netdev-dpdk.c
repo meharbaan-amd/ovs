@@ -6148,8 +6148,9 @@ netdev_dpdk_flow_api_supported(struct netdev *netdev)
 {
     struct netdev_dpdk *dev;
     bool ret = false;
-
-    if ((!strcmp(netdev_get_type(netdev), "vxlan") ||
+    /* Geneve offload provider API support Added */
+    if ((!strcmp(netdev_get_type(netdev), "vxlan") || 
+         !strcmp(netdev_get_type(netdev), "geneve") ||
          !strcmp(netdev_get_type(netdev), "gre")) &&
         !strcmp(netdev_get_dpif_type(netdev), "netdev")) {
         ret = true;
