@@ -38,6 +38,8 @@ bool dpif_is_netdev(const struct dpif *);
 #define NR_QUEUE   1
 #define NR_PMD_THREADS 1
 
+rte_atomic64_t total_enqueue_events;
+rte_atomic64_t total_offloaded;
 #ifdef  __cplusplus
 }
 #endif

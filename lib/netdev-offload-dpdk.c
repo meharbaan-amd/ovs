@@ -3011,7 +3011,6 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
 #endif
         hash = hash_ct_tuple(packet_flow);
 
-        ovs_mutex_lock(&rte_flow_data->lock);
         if (cmap_find(&rte_flow_data->ct_flows, hash) == NULL)
         {
             match = rte_flow_data->match;
@@ -3031,10 +3030,12 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             ct_data->hash = hash;
             conn_key_extract_from_flow(&match.flow, &ct_data->conn_key);
 
+            rte_atomic64_inc(&total_offloaded);
+            ovs_mutex_lock(&rte_flow_data->lock);
             cmap_insert(&rte_flow_data->ct_flows,
                         CONST_CAST(struct cmap_node *, &ct_data->node), hash);
+            ovs_mutex_unlock(&rte_flow_data->lock);
         }
-        ovs_mutex_unlock(&rte_flow_data->lock);
     } /*else {
         VLOG_ERR("Pinged flow not found");
     }*/

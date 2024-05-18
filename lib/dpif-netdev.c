@@ -1680,6 +1680,8 @@ dpif_netdev_init(void)
     unixctl_command_register("dpif-netdev/miniflow-parser-get", "",
                              0, 0, dpif_miniflow_extract_impl_get,
                              NULL);
+    rte_atomic64_init(&total_enqueue_events);
+    rte_atomic64_init(&total_offloaded);
     return 0;
 }
 
@@ -3129,6 +3131,7 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     struct dp_offload_flow_item *flow_offload;
     struct dp_netdev_actions *actions;
 
+    rte_atomic64_inc(&total_enqueue_events);
     if (!netdev_is_flow_api_enabled()) {
         return;
     }
@@ -4813,6 +4816,8 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                               struct netdev_custom_stats *stats)
 {
     enum {
+        DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_EN,
+        DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_OFF,
         DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED,
         DP_NETDEV_HW_OFFLOADS_STATS_INSERTED,
         DP_NETDEV_HW_OFFLOADS_STATS_LAT_CMA_MEAN,
@@ -4824,6 +4829,10 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
         const char *name;
         uint64_t total;
     } hwol_stats[] = {
+        [DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_EN] =
+            { "                Elba Total Enqueued events", 0 },
+        [DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_OFF] =
+            { "                Elba Total offloaded conn", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED] =
             { "                Enqueued offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED] =
@@ -4914,6 +4923,8 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                  "  Total %s", hwol_stats[i].name);
         stats->counters[i].value = hwol_stats[i].total;
     }
+    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_EN].value = rte_atomic64_read(&total_enqueue_events);
+    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_OFF].value = rte_atomic64_read(&total_offloaded);
 
     return 0;
 }
