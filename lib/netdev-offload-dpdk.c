@@ -1098,13 +1098,14 @@ netdev_offload_dpdk_flow_create(struct netdev *netdev,
 
     flow = netdev_dpdk_rte_flow_create(netdev, attr, items, actions, error);
     if (flow) {
+#if 0
         struct netdev_offload_dpdk_data *data;
         unsigned int tid = netdev_offload_thread_id();
 
         data = (struct netdev_offload_dpdk_data *)
             ovsrcu_get(void *, &netdev->hw_info.offload_data);
         data->rte_flow_counters[tid]++;
-
+#endif
         if (!VLOG_DROP_DBG(&rl)) {
             dump_flow(&s, &s_extra, attr, flow_patterns, flow_actions);
             extra_str = ds_cstr(&s_extra);

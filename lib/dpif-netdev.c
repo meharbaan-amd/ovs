@@ -88,6 +88,7 @@
 #include "util.h"
 #include "uuid.h"
 
+__thread int threadid;
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
 /* Auto Load Balancing Defaults */
@@ -2958,7 +2959,7 @@ dp_netdev_flow_offload_main(void *arg)
 
     queue = &ofl_thread->queue;
     mpsc_queue_acquire(queue);
-
+    threadid = 0;
     while (true) {
         backoff = DP_NETDEV_OFFLOAD_BACKOFF_MIN;
         while (mpsc_queue_tail(queue) == NULL) {
@@ -3146,7 +3147,10 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     flow_offload->ufid = flow->mega_ufid;
 
     item->timestamp = pmd->ctx.now;
-    dp_netdev_offload_flow_enqueue(item);
+    /*dp_netdev_offload_flow_enqueue(item);*/
+    dp_netdev_flow_offload_notify(item);
+    dp_netdev_free_flow_offload__(item);
+    
 }
 
 static void
@@ -7092,6 +7096,7 @@ pmd_thread_main(void *f_)
     uint64_t sleep_time = 0;
 
     poll_list = NULL;
+    threadid = pmd->core_id;
 
     /* Stores the pmd thread's 'pmd' to 'per_pmd_key'. */
     ovsthread_setspecific(pmd->dp->per_pmd_key, pmd);
