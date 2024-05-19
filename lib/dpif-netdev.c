@@ -3156,6 +3156,8 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     item->timestamp = pmd->ctx.now;
     /*dp_netdev_offload_flow_enqueue(item);*/
     dp_netdev_flow_offload_notify(item);
+    
+    dp_netdev_flow_unref(flow_offload->flow);
     dp_netdev_free_flow_offload__(item);
     
 }

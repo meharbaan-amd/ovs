@@ -2998,17 +2998,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
     uint32_t hash;
 
     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
-    if (OVS_LIKELY(rte_flow_data)) {
-        if (!rte_flow_data->ct) {
-            VLOG_ERR("Pinged flow is not CT");
-            return EINVAL;
-        }
-#if 0
-        if (!rte_flow_data->rte_flow_action_handle) {
-            VLOG_ERR("Pinged flow does not provide an action handle");
-            return EINVAL;
-        }
-#endif
+    if (OVS_LIKELY(rte_flow_data) && !ovs_mutex_trylock(&rte_flow_data->lock) && rte_flow_data->ct) {
         hash = hash_ct_tuple(packet_flow);
 
         if (cmap_find(&rte_flow_data->ct_flows, hash) == NULL)
@@ -3031,14 +3021,12 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             conn_key_extract_from_flow(&match.flow, &ct_data->conn_key);
 
             rte_atomic64_inc(&total_offloaded);
-            ovs_mutex_lock(&rte_flow_data->lock);
             cmap_insert(&rte_flow_data->ct_flows,
                         CONST_CAST(struct cmap_node *, &ct_data->node), hash);
-            ovs_mutex_unlock(&rte_flow_data->lock);
         }
-    } /*else {
-        VLOG_ERR("Pinged flow not found");
-    }*/
+
+        ovs_mutex_unlock(&rte_flow_data->lock);
+    } 
 
     return 0;
 }
