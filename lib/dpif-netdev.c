@@ -18,6 +18,7 @@
 #include "dpif-netdev.h"
 #include "dpif-netdev-private.h"
 #include "dpif-netdev-private-dfc.h"
+#include "conntrack-private.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -3125,13 +3126,16 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
                          struct dp_netdev_flow *flow,
                          const struct pkt_metadata_nat *pre_nat_tuple,
                          struct flow *packet_flow,
+                         bool enq,
                          odp_port_t orig_in_port OVS_UNUSED)
 {
     struct dp_offload_thread_item *item;
     struct dp_offload_flow_item *flow_offload;
     struct dp_netdev_actions *actions;
-
+    if(!enq)
+        return;
     rte_atomic64_inc(&total_enqueue_events);
+    /*VLOG_ERR("SASA state %x ", packet_flow->ct_state);*/
     if (!netdev_is_flow_api_enabled()) {
         return;
     }
@@ -4293,13 +4297,14 @@ dp_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
                       struct dp_netdev_flow *flow,
                       const struct pkt_metadata_nat *pre_nat_tuple,
                       const struct netdev_flow_key *key,
+                      bool enq, 
                       odp_port_t in_port)
 {
     struct flow packet_flow;
 
     miniflow_expand(&key->mf, &packet_flow);
 
-    queue_netdev_flow_notify(pmd, flow, pre_nat_tuple, &packet_flow, in_port);
+    queue_netdev_flow_notify(pmd, flow, pre_nat_tuple, &packet_flow, enq, in_port);
 }
 
 static int
@@ -8599,6 +8604,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
             } else if (netdev_flow->notifiable) {
                 dp_netdev_flow_notify(pmd, netdev_flow,
                                       &packet->md.ct_pre_nat_tuple, key,
+                                      false,
                                       orig_in_port);
             }
             ovs_mutex_unlock(&pmd->flow_mutex);
@@ -8717,8 +8723,20 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         flow = dp_netdev_flow_cast(rules[i]);
 
         if (flow->notifiable) {
+            bool enq = false;
+            if(packet->md.conn && (packet->md.ct_state == 0x22) && !packet->md.conn->for_est)
+            {
+                packet->md.conn->for_est = true;
+                enq = true;
+            }
+            else if(packet->md.conn && (packet->md.ct_state == 0x2A) && !packet->md.conn->rev_est)
+            {
+                packet->md.conn->rev_est = true;
+                enq = true;
+            }
+            
             dp_netdev_flow_notify(pmd, flow, &packet->md.ct_pre_nat_tuple,
-                                  keys[i], in_port);
+                                  keys[i], enq, in_port);
         }
 
         uint32_t hash =  dp_netdev_flow_hash(&flow->ufid);

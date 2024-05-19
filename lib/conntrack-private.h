@@ -157,6 +157,8 @@ struct conn {
 
     uint32_t tp_id; /* Timeout policy ID. */
     enum ct_timeout tp_timeout;
+    bool for_est;
+    bool rev_est;
 };
 
 enum ct_update_res {
