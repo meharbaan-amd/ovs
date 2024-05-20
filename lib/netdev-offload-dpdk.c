@@ -38,6 +38,8 @@
 #include "conntrack.h"
 #include "conntrack-private.h"
 
+extern __thread int threadid;
+extern uint64_t counter_off[16];
 VLOG_DEFINE_THIS_MODULE(netdev_offload_dpdk);
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(600, 600);
 
@@ -3020,7 +3022,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             ct_data->hash = hash;
             conn_key_extract_from_flow(&match.flow, &ct_data->conn_key);
 
-            rte_atomic64_inc(&total_offloaded);
+            counter_off[threadid]++;
             cmap_insert(&rte_flow_data->ct_flows,
                         CONST_CAST(struct cmap_node *, &ct_data->node), hash);
         }

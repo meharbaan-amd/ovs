@@ -18,7 +18,6 @@
 #include "dpif-netdev.h"
 #include "dpif-netdev-private.h"
 #include "dpif-netdev-private-dfc.h"
-#include "conntrack-private.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -90,6 +89,8 @@
 #include "uuid.h"
 
 __thread int threadid;
+uint64_t counter_en[16];
+uint64_t counter_off[16];
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
 /* Auto Load Balancing Defaults */
@@ -1681,8 +1682,11 @@ dpif_netdev_init(void)
     unixctl_command_register("dpif-netdev/miniflow-parser-get", "",
                              0, 0, dpif_miniflow_extract_impl_get,
                              NULL);
-    rte_atomic64_init(&total_enqueue_events);
-    rte_atomic64_init(&total_offloaded);
+    for(int i = 0; i < 16; i++)
+    {
+        counter_en[i] = 0;
+        counter_off[i] = 0;
+    }
     return 0;
 }
 
@@ -3126,20 +3130,20 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
                          struct dp_netdev_flow *flow,
                          const struct pkt_metadata_nat *pre_nat_tuple,
                          struct flow *packet_flow,
-                         bool enq,
                          odp_port_t orig_in_port OVS_UNUSED)
 {
     struct dp_offload_thread_item *item;
     struct dp_offload_flow_item *flow_offload;
     struct dp_netdev_actions *actions;
-    if(!enq)
+
+    if(!(packet_flow->ct_state & 0x2))
         return;
-    rte_atomic64_inc(&total_enqueue_events);
+
+    //counter_en[threadid]++;
     /*VLOG_ERR("SASA state %x ", packet_flow->ct_state);*/
     if (!netdev_is_flow_api_enabled()) {
         return;
     }
-
     actions = dp_netdev_flow_get_actions(flow);
 
     item = dp_netdev_alloc_flow_offload(pmd->dp, flow, DP_NETDEV_FLOW_OFFLOAD_OP_NOTIFY);
@@ -4299,14 +4303,13 @@ dp_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
                       struct dp_netdev_flow *flow,
                       const struct pkt_metadata_nat *pre_nat_tuple,
                       const struct netdev_flow_key *key,
-                      bool enq, 
                       odp_port_t in_port)
 {
     struct flow packet_flow;
 
     miniflow_expand(&key->mf, &packet_flow);
 
-    queue_netdev_flow_notify(pmd, flow, pre_nat_tuple, &packet_flow, enq, in_port);
+    queue_netdev_flow_notify(pmd, flow, pre_nat_tuple, &packet_flow, in_port);
 }
 
 static int
@@ -4823,8 +4826,8 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                               struct netdev_custom_stats *stats)
 {
     enum {
-        DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_EN,
-        DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_OFF,
+        DP_NETDEV_HW_OFFLOADS_DPU_EN,
+        DP_NETDEV_HW_OFFLOADS_DPU_OFF,
         DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED,
         DP_NETDEV_HW_OFFLOADS_STATS_INSERTED,
         DP_NETDEV_HW_OFFLOADS_STATS_LAT_CMA_MEAN,
@@ -4836,10 +4839,10 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
         const char *name;
         uint64_t total;
     } hwol_stats[] = {
-        [DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_EN] =
-            { "                Elba Total Enqueued events", 0 },
-        [DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_OFF] =
-            { "                Elba Total offloaded conn", 0 },
+        [DP_NETDEV_HW_OFFLOADS_DPU_EN] =
+            { "                DPU Enqueued", 0 },
+        [DP_NETDEV_HW_OFFLOADS_DPU_OFF] =
+            { "                DPU offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED] =
             { "                Enqueued offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED] =
@@ -4930,9 +4933,12 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                  "  Total %s", hwol_stats[i].name);
         stats->counters[i].value = hwol_stats[i].total;
     }
-    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_EN].value = rte_atomic64_read(&total_enqueue_events);
-    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_DPU_TOT_OFF].value = rte_atomic64_read(&total_offloaded);
-
+    
+    for(i = 0; i < 16; i++)
+    {
+       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_EN].value += counter_en[i];
+       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_OFF].value += counter_off[i];
+    }
     return 0;
 }
 
@@ -8606,7 +8612,6 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
             } else if (netdev_flow->notifiable) {
                 dp_netdev_flow_notify(pmd, netdev_flow,
                                       &packet->md.ct_pre_nat_tuple, key,
-                                      false,
                                       orig_in_port);
             }
             ovs_mutex_unlock(&pmd->flow_mutex);
@@ -8725,20 +8730,8 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         flow = dp_netdev_flow_cast(rules[i]);
 
         if (flow->notifiable) {
-            bool enq = false;
-            if(packet->md.conn && (packet->md.ct_state == 0x22) && !packet->md.conn->for_est)
-            {
-                packet->md.conn->for_est = true;
-                enq = true;
-            }
-            else if(packet->md.conn && (packet->md.ct_state == 0x2A) && !packet->md.conn->rev_est)
-            {
-                packet->md.conn->rev_est = true;
-                enq = true;
-            }
-            
             dp_netdev_flow_notify(pmd, flow, &packet->md.ct_pre_nat_tuple,
-                                  keys[i], enq, in_port);
+                                  keys[i], in_port);
         }
 
         uint32_t hash =  dp_netdev_flow_hash(&flow->ufid);
