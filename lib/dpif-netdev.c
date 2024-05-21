@@ -88,6 +88,9 @@
 #include "util.h"
 #include "uuid.h"
 
+__thread int threadid;
+uint64_t counter_en[16];
+uint64_t counter_off[16];
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
 /* Auto Load Balancing Defaults */
@@ -1679,6 +1682,11 @@ dpif_netdev_init(void)
     unixctl_command_register("dpif-netdev/miniflow-parser-get", "",
                              0, 0, dpif_miniflow_extract_impl_get,
                              NULL);
+    for(int i = 0; i < 16; i++)
+    {
+        counter_en[i] = 0;
+        counter_off[i] = 0;
+    }
     return 0;
 }
 
@@ -2958,7 +2966,7 @@ dp_netdev_flow_offload_main(void *arg)
 
     queue = &ofl_thread->queue;
     mpsc_queue_acquire(queue);
-
+    threadid = 0;
     while (true) {
         backoff = DP_NETDEV_OFFLOAD_BACKOFF_MIN;
         while (mpsc_queue_tail(queue) == NULL) {
@@ -3128,10 +3136,14 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     struct dp_offload_flow_item *flow_offload;
     struct dp_netdev_actions *actions;
 
+    if(!(packet_flow->ct_state & 0x2))
+        return;
+
+    //counter_en[threadid]++;
+    /*VLOG_ERR("SASA state %x ", packet_flow->ct_state);*/
     if (!netdev_is_flow_api_enabled()) {
         return;
     }
-
     actions = dp_netdev_flow_get_actions(flow);
 
     item = dp_netdev_alloc_flow_offload(pmd->dp, flow, DP_NETDEV_FLOW_OFFLOAD_OP_NOTIFY);
@@ -3146,7 +3158,12 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     flow_offload->ufid = flow->mega_ufid;
 
     item->timestamp = pmd->ctx.now;
-    dp_netdev_offload_flow_enqueue(item);
+    /*dp_netdev_offload_flow_enqueue(item);*/
+    dp_netdev_flow_offload_notify(item);
+    
+    dp_netdev_flow_unref(flow_offload->flow);
+    dp_netdev_free_flow_offload__(item);
+    
 }
 
 static void
@@ -4809,6 +4826,8 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                               struct netdev_custom_stats *stats)
 {
     enum {
+        DP_NETDEV_HW_OFFLOADS_DPU_EN,
+        DP_NETDEV_HW_OFFLOADS_DPU_OFF,
         DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED,
         DP_NETDEV_HW_OFFLOADS_STATS_INSERTED,
         DP_NETDEV_HW_OFFLOADS_STATS_LAT_CMA_MEAN,
@@ -4820,6 +4839,10 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
         const char *name;
         uint64_t total;
     } hwol_stats[] = {
+        [DP_NETDEV_HW_OFFLOADS_DPU_EN] =
+            { "                DPU Enqueued", 0 },
+        [DP_NETDEV_HW_OFFLOADS_DPU_OFF] =
+            { "                DPU offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED] =
             { "                Enqueued offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED] =
@@ -4910,7 +4933,12 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                  "  Total %s", hwol_stats[i].name);
         stats->counters[i].value = hwol_stats[i].total;
     }
-
+    
+    for(i = 0; i < 16; i++)
+    {
+       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_EN].value += counter_en[i];
+       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_OFF].value += counter_off[i];
+    }
     return 0;
 }
 
@@ -7092,6 +7120,7 @@ pmd_thread_main(void *f_)
     uint64_t sleep_time = 0;
 
     poll_list = NULL;
+    threadid = pmd->core_id;
 
     /* Stores the pmd thread's 'pmd' to 'per_pmd_key'. */
     ovsthread_setspecific(pmd->dp->per_pmd_key, pmd);

@@ -38,6 +38,8 @@
 #include "conntrack.h"
 #include "conntrack-private.h"
 
+extern __thread int threadid;
+extern uint64_t counter_off[16];
 VLOG_DEFINE_THIS_MODULE(netdev_offload_dpdk);
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(600, 600);
 
@@ -1098,13 +1100,14 @@ netdev_offload_dpdk_flow_create(struct netdev *netdev,
 
     flow = netdev_dpdk_rte_flow_create(netdev, attr, items, actions, error);
     if (flow) {
+#if 0
         struct netdev_offload_dpdk_data *data;
         unsigned int tid = netdev_offload_thread_id();
 
         data = (struct netdev_offload_dpdk_data *)
             ovsrcu_get(void *, &netdev->hw_info.offload_data);
         data->rte_flow_counters[tid]++;
-
+#endif
         if (!VLOG_DROP_DBG(&rl)) {
             dump_flow(&s, &s_extra, attr, flow_patterns, flow_actions);
             extra_str = ds_cstr(&s_extra);
@@ -2997,20 +3000,9 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
     uint32_t hash;
 
     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
-    if (OVS_LIKELY(rte_flow_data)) {
-        if (!rte_flow_data->ct) {
-            VLOG_ERR("Pinged flow is not CT");
-            return EINVAL;
-        }
-#if 0
-        if (!rte_flow_data->rte_flow_action_handle) {
-            VLOG_ERR("Pinged flow does not provide an action handle");
-            return EINVAL;
-        }
-#endif
+    if (OVS_LIKELY(rte_flow_data) && !ovs_mutex_trylock(&rte_flow_data->lock) && rte_flow_data->ct) {
         hash = hash_ct_tuple(packet_flow);
 
-        ovs_mutex_lock(&rte_flow_data->lock);
         if (cmap_find(&rte_flow_data->ct_flows, hash) == NULL)
         {
             match = rte_flow_data->match;
@@ -3030,13 +3022,13 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             ct_data->hash = hash;
             conn_key_extract_from_flow(&match.flow, &ct_data->conn_key);
 
+            counter_off[threadid]++;
             cmap_insert(&rte_flow_data->ct_flows,
                         CONST_CAST(struct cmap_node *, &ct_data->node), hash);
         }
+
         ovs_mutex_unlock(&rte_flow_data->lock);
-    } /*else {
-        VLOG_ERR("Pinged flow not found");
-    }*/
+    } 
 
     return 0;
 }
