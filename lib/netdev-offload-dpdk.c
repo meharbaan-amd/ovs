@@ -1587,6 +1587,8 @@ parse_geneve_match(struct flow_patterns *patterns,
     consumed_masks->tunnel.metadata.present.map = 0;
     consumed_masks->tunnel.metadata.present.len = 0;
 
+    if(match->flow.tunnel.metadata.present.len)
+        memset(consumed_masks->tunnel.metadata.opts.u8, 0, sizeof(consumed_masks->tunnel.metadata.opts.u8));
     add_flow_pattern(patterns, RTE_FLOW_ITEM_TYPE_GENEVE, gnv_spec, gnv_mask,
                      NULL);
     return 0;
