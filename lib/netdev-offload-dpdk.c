@@ -824,67 +824,6 @@ dump_vxlan_encap(struct ds *s, const struct rte_flow_item *items)
     }
 }
 
-#if 0
-static void
-dump_geneve_encap(struct ds *s, const struct rte_flow_item *items)
-{
-    const struct rte_flow_item_eth *eth = NULL;
-    const struct rte_flow_item_ipv4 *ipv4 = NULL;
-    const struct rte_flow_item_ipv6 *ipv6 = NULL;
-    const struct rte_flow_item_udp *udp = NULL;
-    const struct rte_flow_item_geneve *geneve = NULL;
-
-    for (; items && items->type != RTE_FLOW_ITEM_TYPE_END; items++) {
-        if (items->type == RTE_FLOW_ITEM_TYPE_ETH) {
-            eth = items->spec;
-        } else if (items->type == RTE_FLOW_ITEM_TYPE_IPV4) {
-            ipv4 = items->spec;
-        } else if (items->type == RTE_FLOW_ITEM_TYPE_IPV6) {
-            ipv6 = items->spec;
-        } else if (items->type == RTE_FLOW_ITEM_TYPE_UDP) {
-            udp = items->spec;
-        } else if (items->type == RTE_FLOW_ITEM_TYPE_GENEVE) {
-            geneve = items->spec;
-        }
-    }
-
-    ds_put_format(s, "set geneve ip-version %s ",
-                  ipv4 ? "ipv4" : ipv6 ? "ipv6" : "ERR");
-    if (geneve) {
-        ovs_be32 vni;
-
-        vni = get_unaligned_be32(ALIGNED_CAST(ovs_be32 *,
-                                              geneve->vni));
-        ds_put_format(s, "vni %"PRIu32" ", ntohl(vni) >> 8);
-    }
-    if (udp) {
-        ds_put_format(s, "udp-src %"PRIu16" udp-dst %"PRIu16" ",
-                      ntohs(udp->hdr.src_port), ntohs(udp->hdr.dst_port));
-    }
-    if (ipv4) {
-        ds_put_format(s, "ip-src "IP_FMT" ip-dst "IP_FMT" ",
-                      IP_ARGS(ipv4->hdr.src_addr),
-                      IP_ARGS(ipv4->hdr.dst_addr));
-    }
-    if (ipv6) {
-        struct in6_addr addr;
-
-        ds_put_cstr(s, "ip-src ");
-        memcpy(&addr, ipv6->hdr.src_addr, sizeof addr);
-        ipv6_format_mapped(&addr, s);
-        ds_put_cstr(s, " ip-dst ");
-        memcpy(&addr, ipv6->hdr.dst_addr, sizeof addr);
-        ipv6_format_mapped(&addr, s);
-        ds_put_cstr(s, " ");
-    }
-    if (eth) {
-        ds_put_format(s, "eth-src "ETH_ADDR_FMT" eth-dst "ETH_ADDR_FMT,
-                      ETH_ADDR_BYTES_ARGS(eth->src.addr_bytes),
-                      ETH_ADDR_BYTES_ARGS(eth->dst.addr_bytes));
-    }
-}
-#endif
-
 static void
 dump_flow_action(struct ds *s, struct ds *s_extra,
                  struct flow_actions *flow_actions, int act_index)
@@ -1033,15 +972,6 @@ dump_flow_action(struct ds *s, struct ds *s_extra,
         ds_put_cstr(s, "vxlan_encap / ");
         dump_vxlan_encap(s_extra, items);
         ds_put_cstr(s_extra, ";");
-    #if 0
-    } else if (actions->type == RTE_FLOW_ACTION_TYPE_GENEVE_ENCAP) {
-        const struct rte_flow_action_geneve_encap *geneve_encap = actions->conf;
-        const struct rte_flow_item *items = geneve_encap->definition;
-
-        ds_put_cstr(s, "geneve_encap / ");
-        dump_geneve_encap(s_extra, items);
-        ds_put_cstr(s_extra, ";");
-    #endif
     } else if (actions->type == RTE_FLOW_ACTION_TYPE_JUMP) {
         const struct rte_flow_action_jump *jump = actions->conf;
 
@@ -1587,6 +1517,8 @@ parse_geneve_match(struct flow_patterns *patterns,
     consumed_masks->tunnel.metadata.present.map = 0;
     consumed_masks->tunnel.metadata.present.len = 0;
 
+    if(match->flow.tunnel.metadata.present.len)
+        memset(consumed_masks->tunnel.metadata.opts.u8, 0, sizeof(consumed_masks->tunnel.metadata.opts.u8));
     add_flow_pattern(patterns, RTE_FLOW_ITEM_TYPE_GENEVE, gnv_spec, gnv_mask,
                      NULL);
     return 0;
@@ -2346,103 +2278,6 @@ err:
     return -1;
 }
 
-#if 0
-/* For geneve
- * ETH / IPv4(6) / UDP / VXLAN / END
- */
-
-struct rte_flow_action_geneve_encap {
-    /**
-     * Encapsulating geneve tunnel definition
-     * (terminated by the END pattern item).
-     */
-    struct rte_flow_item *definition;
-};
-
-#define ACTION_GENEVE_ENCAP_ITEMS_NUM 5
-
-static int
-add_geneve_encap_action(struct flow_actions *actions,
-                       const void *header)
-{
-    const struct eth_header *eth;
-    const struct udp_header *udp;
-    struct geneve_data {
-        struct rte_flow_action_geneve_encap conf;
-        struct rte_flow_item items[ACTION_GENEVE_ENCAP_ITEMS_NUM];
-    } *geneve_data;
-    BUILD_ASSERT_DECL(offsetof(struct geneve_data, conf) == 0);
-    const void *geneve;
-    const void *l3;
-    const void *l4;
-    int field;
-
-    geneve_data = xzalloc(sizeof *geneve_data);
-    field = 0;
-
-    eth = header;
-    /* Ethernet */
-    geneve_data->items[field].type = RTE_FLOW_ITEM_TYPE_ETH;
-    geneve_data->items[field].spec = eth;
-    geneve_data->items[field].mask = &rte_flow_item_eth_mask;
-    field++;
-
-    l3 = eth + 1;
-    /* IP */
-    if (eth->eth_type == htons(ETH_TYPE_IP)) {
-        /* IPv4 */
-        const struct ip_header *ip = l3;
-
-        geneve_data->items[field].type = RTE_FLOW_ITEM_TYPE_IPV4;
-        geneve_data->items[field].spec = ip;
-        geneve_data->items[field].mask = &rte_flow_item_ipv4_mask;
-
-        if (ip->ip_proto != IPPROTO_UDP) {
-            goto err;
-        }
-        l4 = (ip + 1);
-    } else if (eth->eth_type == htons(ETH_TYPE_IPV6)) {
-        const struct ovs_16aligned_ip6_hdr *ip6 = l3;
-
-        geneve_data->items[field].type = RTE_FLOW_ITEM_TYPE_IPV6;
-        geneve_data->items[field].spec = ip6;
-        geneve_data->items[field].mask = &rte_flow_item_ipv6_mask;
-
-        if (ip6->ip6_nxt != IPPROTO_UDP) {
-            goto err;
-        }
-        l4 = (ip6 + 1);
-    } else {
-        goto err;
-    }
-    field++;
-
-    udp = l4;
-    geneve_data->items[field].type = RTE_FLOW_ITEM_TYPE_UDP;
-    geneve_data->items[field].spec = udp;
-    geneve_data->items[field].mask = &rte_flow_item_udp_mask;
-    field++;
-
-    geneve = (udp + 1);
-    geneve_data->items[field].type = RTE_FLOW_ITEM_TYPE_GENEVE;
-    geneve_data->items[field].spec = geneve;
-    geneve_data->items[field].mask = &rte_flow_item_geneve_mask;
-    field++;
-
-    geneve_data->items[field].type = RTE_FLOW_ITEM_TYPE_END;
-
-    geneve_data->conf.definition = geneve_data->items;
-
-    add_flow_action(actions, RTE_FLOW_ACTION_TYPE_GENEVE_ENCAP, geneve_data);
-
-    return 0;
-err:
-    free(geneve_data);
-    return -1;
-}
-
-#endif
-
 static int
 parse_vlan_push_action(struct flow_actions *actions,
                        const struct ovs_action_push_vlan *vlan_push)
@@ -2477,12 +2312,6 @@ add_tunnel_push_action(struct flow_actions *actions,
          !add_vxlan_encap_action(actions, tnl_push->header)) {
          return;
      }
-     #if 0
-     else if (tnl_push->tnl_type == OVS_VPORT_TYPE_GENEVE &&
-         !add_geneve_encap_action(actions, tnl_push->header)) {
-         return;
-     }
-     #endif
 
      raw_encap = xzalloc(sizeof *raw_encap);
      raw_encap->data = (uint8_t *) tnl_push->header;
