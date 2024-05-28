@@ -99,10 +99,10 @@ struct ufid_to_rte_flow_data {
     bool actions_offloaded;
     struct dpif_flow_stats stats;
     struct netdev *physdev;
-    struct ovs_mutex lock;
+    struct ovs_mutex lock[8];
     unsigned int creation_tid;
     bool dead;
-    struct cmap ct_flows;
+    struct cmap ct_flows[8];
     struct match match;
     struct conntrack *conntrack;
 };
@@ -322,14 +322,16 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid, struct netdev *netdev,
     data->ct = conntracked;
     data->conntrack = conntracked ? conntrack : NULL;
     data->match = *match;
-    ovs_mutex_init(&data->lock);
+    for(int i = 0; i < 8;i++)
+    ovs_mutex_init(&data->lock[i]);
 
     if (conntracked) {
         ct_data->rte_flow = rte_flow;
         ct_data->hash = hash_ct_tuple(&match->flow);
         conn_key_extract_from_flow(&match->flow, &ct_data->conn_key);
-        cmap_init(&data->ct_flows);
-        cmap_insert(&data->ct_flows,
+        for(int i = 0; i < 8;i++)
+        cmap_init(&data->ct_flows[i]);
+        cmap_insert(&data->ct_flows[0],
                     CONST_CAST(struct cmap_node *, &ct_data->node),
                     ct_data->hash);
     }
@@ -343,7 +345,8 @@ ufid_to_rte_flow_associate(const ovs_u128 *ufid, struct netdev *netdev,
 static void
 rte_flow_data_unref(struct ufid_to_rte_flow_data *data)
 {
-    ovs_mutex_destroy(&data->lock);
+    for(int i = 0; i< 8;i++)
+    ovs_mutex_destroy(&data->lock[i]);
     free(data);
 }
 
@@ -2632,12 +2635,10 @@ netdev_offload_dpdk_flow_destroy(struct ufid_to_rte_flow_data *rte_flow_data)
     struct netdev *netdev;
     ovs_u128 *ufid;
     bool transfer;
-    int ret;
+    int ret = 0;
 
-    ovs_mutex_lock(&rte_flow_data->lock);
 
     if (rte_flow_data->dead) {
-        ovs_mutex_unlock(&rte_flow_data->lock);
         return 0;
     }
 
@@ -2651,27 +2652,39 @@ netdev_offload_dpdk_flow_destroy(struct ufid_to_rte_flow_data *rte_flow_data)
 
     if (rte_flow_data->ct) {
         struct ct_flow_data *data;
-        CMAP_FOR_EACH (data, node, &rte_flow_data->ct_flows) {
-            ret = netdev_dpdk_rte_flow_destroy(physdev, transfer, data->rte_flow, &error);
-            if (ret) {
-                break;
+        for(int i = 0; i< 8; i++)
+        {
+            ovs_mutex_lock(&rte_flow_data->lock[i]);
+            CMAP_FOR_EACH (data, node, &rte_flow_data->ct_flows[i]) {
+                ret = netdev_dpdk_rte_flow_destroy(physdev, transfer, data->rte_flow, &error);
+                if (ret) {
+                    break;
+                }
+                data->rte_flow = NULL;
+                cmap_remove(&rte_flow_data->ct_flows[i], &data->node, data->hash);
+                ovsrcu_postpone(free, data);
             }
-            data->rte_flow = NULL;
-            cmap_remove(&rte_flow_data->ct_flows, &data->node, data->hash);
-            ovsrcu_postpone(free, data);
+            if (!ret)
+                cmap_destroy(&rte_flow_data->ct_flows[i]);
+            ovs_mutex_unlock(&rte_flow_data->lock[i]);
         }
-        if (!ret) {
-            cmap_destroy(&rte_flow_data->ct_flows);
+        if (!ret)
+        {
+            ovs_mutex_lock(&rte_flow_data->lock[0]);
             if(rte_flow_data->rte_flow_action_handle)
             {
                 ret = netdev_dpdk_rte_flow_action_handle_destroy(physdev, transfer,
                                             rte_flow_data->rte_flow_action_handle);
             }
+            ovs_mutex_unlock(&rte_flow_data->lock[0]);
         }
     } else {
+        ovs_mutex_lock(&rte_flow_data->lock[0]);
         ret = netdev_dpdk_rte_flow_destroy(physdev, transfer, rte_flow, &error);
+        ovs_mutex_unlock(&rte_flow_data->lock[0]);
     }
 
+    ovs_mutex_lock(&rte_flow_data->lock[0]);
     if (ret == 0) {
         struct netdev_offload_dpdk_data *data;
         unsigned int tid = netdev_offload_thread_id();
@@ -2693,8 +2706,7 @@ netdev_offload_dpdk_flow_destroy(struct ufid_to_rte_flow_data *rte_flow_data)
                  netdev_dpdk_get_port_id(physdev, transfer),
                  UUID_ARGS((struct uuid *) ufid));
     }
-
-    ovs_mutex_unlock(&rte_flow_data->lock);
+    ovs_mutex_unlock(&rte_flow_data->lock[0]);
 
     return ret;
 }
@@ -2829,10 +2841,12 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
     uint32_t hash;
 
     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
-    if (OVS_LIKELY(rte_flow_data) && !ovs_mutex_trylock(&rte_flow_data->lock) && rte_flow_data->ct) {
+    if (OVS_LIKELY(rte_flow_data) && rte_flow_data->ct) {
         hash = hash_ct_tuple(packet_flow);
-
-        if (cmap_find(&rte_flow_data->ct_flows, hash) == NULL)
+        //if(ovs_mutex_trylock(&rte_flow_data->lock[threadid]))
+        //    return -1;
+        ovs_mutex_lock(&rte_flow_data->lock[threadid]);
+        if (cmap_find(&rte_flow_data->ct_flows[threadid], hash) == NULL)
         {
             match = rte_flow_data->match;
             match.flow = *packet_flow;
@@ -2842,7 +2856,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
                                                        actions_len, orig_in_port,
                                                        rte_flow_data->rte_flow_action_handle);
             if (!rte_flow) {
-                ovs_mutex_unlock(&rte_flow_data->lock);
+                ovs_mutex_unlock(&rte_flow_data->lock[threadid]);
                 return EFAULT;
             }
 
@@ -2852,11 +2866,11 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             conn_key_extract_from_flow(&match.flow, &ct_data->conn_key);
 
             counter_off[threadid]++;
-            cmap_insert(&rte_flow_data->ct_flows,
+            cmap_insert(&rte_flow_data->ct_flows[threadid],
                         CONST_CAST(struct cmap_node *, &ct_data->node), hash);
         }
 
-        ovs_mutex_unlock(&rte_flow_data->lock);
+        ovs_mutex_unlock(&rte_flow_data->lock[threadid]);
     } 
 
     return 0;
@@ -2926,7 +2940,7 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
 
     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
     if (!rte_flow_data || (!rte_flow_data->rte_flow && !rte_flow_data->ct) ||
-        rte_flow_data->dead || ovs_mutex_trylock(&rte_flow_data->lock)) {
+        rte_flow_data->dead || ovs_mutex_trylock(&rte_flow_data->lock[0])) {
         return -1;
     }
 
@@ -2946,37 +2960,48 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
         goto out;
     }
     attrs->dp_layer = "dpdk";
+    ovs_mutex_unlock(&rte_flow_data->lock[0]);
     if (rte_flow_data->ct) {
         struct ct_flow_data *data;
-        CMAP_FOR_EACH (data, node, &rte_flow_data->ct_flows) {
-            if (!data->rte_flow) {
-                continue;
-            }
+        for(int i = 0; i < 8; i++)
+        {
+            if(ovs_mutex_trylock(&rte_flow_data->lock[i]))
+                 continue; 
+            
+            CMAP_FOR_EACH (data, node, &rte_flow_data->ct_flows[i]) {
+                if (!data->rte_flow) {
+                     continue;
+                }
 
-            query = (struct rte_flow_query_count) { .reset = 1 };
-            ret = netdev_dpdk_rte_flow_query_count(rte_flow_data->physdev,
-                                                   data->rte_flow, &query,
-                                                   &error);
-            if (ret) {
-                VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" CT flow handle: %s",
-                            netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
-                            error.message);
-                goto out;
-            }
-            if (!conntrack_check(rte_flow_data->conntrack, &data->conn_key, now, query.hits_set && query.hits)) {
-                ret = netdev_dpdk_rte_flow_destroy(rte_flow_data->physdev, true,
-                                                   data->rte_flow, &error);
+                query = (struct rte_flow_query_count) { .reset = 1 };
+                ret = netdev_dpdk_rte_flow_query_count(rte_flow_data->physdev,
+                                                       data->rte_flow, &query,
+                                                       &error);
                 if (ret) {
-                    VLOG_DBG_RL(&rl, "%s: Failed to destroy ufid "UUID_FMT" CT flow handle: %s",
+                    VLOG_DBG_RL(&rl, "%s: Failed to query ufid "UUID_FMT" CT flow handle: %s",
                                 netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
                                 error.message);
-                    goto out;
+                    goto out_cmap;
                 }
-                data->rte_flow = NULL;
-                cmap_remove(&rte_flow_data->ct_flows, &data->node, data->hash);
-                ovsrcu_postpone(free, data);
-            }
+                if (!conntrack_check(rte_flow_data->conntrack, &data->conn_key, now, query.hits_set && query.hits)) {
+                    ret = netdev_dpdk_rte_flow_destroy(rte_flow_data->physdev, true,
+                                                       data->rte_flow, &error);
+                    if (ret) {
+                        VLOG_DBG_RL(&rl, "%s: Failed to destroy ufid "UUID_FMT" CT flow handle: %s",
+                                    netdev_get_name(netdev), UUID_ARGS((struct uuid *) ufid),
+                                    error.message);
+                        goto out_cmap;
+                    }
+                    data->rte_flow = NULL;
+                    cmap_remove(&rte_flow_data->ct_flows[i], &data->node, data->hash);
+                    ovsrcu_postpone(free, data);
+                }
+           }
+out_cmap:
+           ovs_mutex_unlock(&rte_flow_data->lock[i]);
        }
+       if(ovs_mutex_trylock(&rte_flow_data->lock[0]))
+               return -1;
        if(rte_flow_data->rte_flow_action_handle)
        {
            ret = netdev_dpdk_rte_flow_action_handle_query(rte_flow_data->physdev, true,
@@ -2990,6 +3015,8 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
            }
        }
     } else {
+       if(ovs_mutex_trylock(&rte_flow_data->lock[0]))
+               return -1;
         ret = netdev_dpdk_rte_flow_query_count(rte_flow_data->physdev,
                                                rte_flow_data->rte_flow, &query,
                                                &error);
@@ -3007,7 +3034,7 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
     }
     memcpy(stats, &rte_flow_data->stats, sizeof *stats);
 out:
-    ovs_mutex_unlock(&rte_flow_data->lock);
+    ovs_mutex_unlock(&rte_flow_data->lock[0]);
     return ret;
 }
 

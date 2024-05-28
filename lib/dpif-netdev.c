@@ -91,6 +91,7 @@
 __thread int threadid;
 uint64_t counter_en[16];
 uint64_t counter_off[16];
+uint64_t counter_de[16];
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
 /* Auto Load Balancing Defaults */
@@ -390,7 +391,9 @@ struct dp_offload_thread_item {
     enum dp_offload_type type;
     long long int timestamp;
     struct dp_netdev *dp;
+    uint8_t id;
     union dp_offload_thread_data data[0];
+ 
 };
 
 struct dp_offload_thread {
@@ -401,6 +404,7 @@ struct dp_offload_thread {
         struct cmap mark_to_flow;
         struct mov_avg_cma cma;
         struct mov_avg_ema ema;
+        uint8_t id;
     );
 };
 static struct dp_offload_thread *dp_offload_threads;
@@ -430,6 +434,7 @@ dp_netdev_offload_init(void)
         atomic_init(&thread->enqueued_item, 0);
         mov_avg_cma_init(&thread->cma);
         mov_avg_ema_init(&thread->ema, 100);
+        thread->id = tid;
         ovs_thread_create("hw_offload", dp_netdev_flow_offload_main, thread);
     }
 
@@ -1684,6 +1689,7 @@ dpif_netdev_init(void)
                              NULL);
     for(int i = 0; i < 16; i++)
     {
+        counter_de[i] = 0;
         counter_en[i] = 0;
         counter_off[i] = 0;
     }
@@ -2723,7 +2729,8 @@ dp_netdev_free_flow_offload(struct dp_offload_thread_item *offload)
     struct dp_offload_flow_item *flow_offload = &offload->data->flow;
 
     dp_netdev_flow_unref(flow_offload->flow);
-    ovsrcu_postpone(dp_netdev_free_flow_offload__, offload);
+    //ovsrcu_postpone(dp_netdev_free_flow_offload__, offload);
+    dp_netdev_free_flow_offload__(offload);
 }
 
 static void
@@ -2754,14 +2761,17 @@ dp_netdev_append_offload(struct dp_offload_thread_item *offload,
 static void
 dp_netdev_offload_flow_enqueue(struct dp_offload_thread_item *item)
 {
-    struct dp_offload_flow_item *flow_offload = &item->data->flow;
+//    struct dp_offload_flow_item *flow_offload = &item->data->flow;
     unsigned int tid;
 
     ovs_assert(item->type == DP_OFFLOAD_FLOW);
 
-    tid = netdev_offload_ufid_to_thread_id(flow_offload->flow->mega_ufid);
+//    tid = netdev_offload_ufid_to_thread_id(flow_offload->flow->mega_ufid);
+    tid = item->id;
     dp_netdev_append_offload(item, tid);
 }
+// 0th 0  --> dequeue 8  
+// 1   1  --> dequeue 9
 
 static int
 dp_netdev_flow_offload_del(struct dp_offload_thread_item *item)
@@ -2871,7 +2881,7 @@ dp_netdev_flow_offload_notify(struct dp_offload_thread_item *item)
     const char *dpif_type_str = dpif_normalize_type(dp->class->type);
     struct netdev *port;
     int ret;
-
+    //return -1;
     if (flow->dead) {
         return -1;
     }
@@ -2949,8 +2959,8 @@ dp_offload_flush(struct dp_offload_thread_item *item)
 }
 
 #define DP_NETDEV_OFFLOAD_BACKOFF_MIN 1
-#define DP_NETDEV_OFFLOAD_BACKOFF_MAX 64
-#define DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_US (10 * 1000) /* 10 ms */
+#define DP_NETDEV_OFFLOAD_BACKOFF_MAX 1
+#define DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_US (1 * 1000) /* 10 ms */
 
 static void *
 dp_netdev_flow_offload_main(void *arg)
@@ -2963,10 +2973,22 @@ dp_netdev_flow_offload_main(void *arg)
     long long int next_rcu;
     long long int now;
     uint64_t backoff;
+//    unsigned int nb_offload_thread = netdev_offload_thread_nb();
 
     queue = &ofl_thread->queue;
     mpsc_queue_acquire(queue);
-    threadid = 0;
+#if 0
+    cpu_set_t cpuset; 
+
+    CPU_ZERO(&cpuset);
+    /* offload thread should start from 16 - number_of_threads. */
+    #define MAX_CORES 16
+    CPU_SET( ofl_thread->id + (MAX_CORES - nb_offload_thread) , &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+#endif
+    threadid = ofl_thread->id;
+
+
     while (true) {
         backoff = DP_NETDEV_OFFLOAD_BACKOFF_MIN;
         while (mpsc_queue_tail(queue) == NULL) {
@@ -2975,7 +2997,6 @@ dp_netdev_flow_offload_main(void *arg)
                 backoff <<= 1;
             }
         }
-
         next_rcu = time_usec() + DP_NETDEV_OFFLOAD_QUIESCE_INTERVAL_US;
         MPSC_QUEUE_FOR_EACH_POP (node, queue) {
             offload = CONTAINER_OF(node, struct dp_offload_thread_item, node);
@@ -2991,15 +3012,13 @@ dp_netdev_flow_offload_main(void *arg)
             default:
                 OVS_NOT_REACHED();
             }
-
             now = time_usec();
 
             latency_us = now - offload->timestamp;
             mov_avg_cma_update(&ofl_thread->cma, latency_us);
             mov_avg_ema_update(&ofl_thread->ema, latency_us);
-
             dp_netdev_free_offload(offload);
-
+            counter_de[ofl_thread->id]++;
             /* Do RCU synchronization at fixed interval. */
             if (now > next_rcu) {
                 ovsrcu_quiesce();
@@ -3135,12 +3154,10 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     struct dp_offload_thread_item *item;
     struct dp_offload_flow_item *flow_offload;
     struct dp_netdev_actions *actions;
-
     if(!(packet_flow->ct_state & 0x2))
         return;
-
-    //counter_en[threadid]++;
     /*VLOG_ERR("SASA state %x ", packet_flow->ct_state);*/
+    counter_en[threadid]++;
     if (!netdev_is_flow_api_enabled()) {
         return;
     }
@@ -3156,13 +3173,16 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     flow_offload->orig_in_port = flow->orig_in_port;
     flow_offload->pre_nat_tuple = *pre_nat_tuple;
     flow_offload->ufid = flow->mega_ufid;
+    item->id = pmd->core_id;
 
     item->timestamp = pmd->ctx.now;
-    /*dp_netdev_offload_flow_enqueue(item);*/
+    //dp_netdev_offload_flow_enqueue(item);
+#if 1
     dp_netdev_flow_offload_notify(item);
     
     dp_netdev_flow_unref(flow_offload->flow);
     dp_netdev_free_flow_offload__(item);
+#endif
     
 }
 
@@ -4827,6 +4847,7 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
 {
     enum {
         DP_NETDEV_HW_OFFLOADS_DPU_EN,
+        DP_NETDEV_HW_OFFLOADS_DPU_DE,
         DP_NETDEV_HW_OFFLOADS_DPU_OFF,
         DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED,
         DP_NETDEV_HW_OFFLOADS_STATS_INSERTED,
@@ -4840,9 +4861,11 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
         uint64_t total;
     } hwol_stats[] = {
         [DP_NETDEV_HW_OFFLOADS_DPU_EN] =
-            { "                DPU Enqueued", 0 },
+            { "                DPU Elba final Enqueued", 0 },
+        [DP_NETDEV_HW_OFFLOADS_DPU_DE] =
+            { "                DPU Elba final Dequeued", 0 },
         [DP_NETDEV_HW_OFFLOADS_DPU_OFF] =
-            { "                DPU offloads", 0 },
+            { "                DPU Elba final offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED] =
             { "                Enqueued offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED] =
@@ -4909,6 +4932,9 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                 mov_avg_ema(&dp_offload_threads[tid].ema);
             counts[DP_NETDEV_HW_OFFLOADS_STATS_LAT_EMA_STDDEV] =
                 mov_avg_ema_std_dev(&dp_offload_threads[tid].ema);
+            /*counts[DP_NETDEV_HW_OFFLOADS_DPU_EN] = counter_en[tid];
+            counts[DP_NETDEV_HW_OFFLOADS_DPU_DE] = counter_de[tid];
+            counts[DP_NETDEV_HW_OFFLOADS_DPU_OFF] = counter_off[tid];*/
         }
 
         for (i = 0; i < ARRAY_SIZE(hwol_stats); i++) {
@@ -4933,10 +4959,10 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                  "  Total %s", hwol_stats[i].name);
         stats->counters[i].value = hwol_stats[i].total;
     }
-    
     for(i = 0; i < 16; i++)
     {
        stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_EN].value += counter_en[i];
+       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_DE].value += counter_de[i];
        stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_OFF].value += counter_off[i];
     }
     return 0;
