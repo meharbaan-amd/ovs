@@ -33,8 +33,8 @@ static const char *ct_timeout_str[] = {
 
 /* Default timeout policy in seconds. */
 static unsigned int ct_dpif_netdev_tp_def[] = {
-    [CT_DPIF_TP_ATTR_TCP_SYN_SENT] = 5,
-    [CT_DPIF_TP_ATTR_TCP_SYN_RECV] = 5,
+    [CT_DPIF_TP_ATTR_TCP_SYN_SENT] = 2,
+    [CT_DPIF_TP_ATTR_TCP_SYN_RECV] = 2,
     [CT_DPIF_TP_ATTR_TCP_ESTABLISHED] = 10,
     [CT_DPIF_TP_ATTR_TCP_FIN_WAIT] = 1,
     [CT_DPIF_TP_ATTR_TCP_TIME_WAIT] = 1,
