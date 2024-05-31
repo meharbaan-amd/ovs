@@ -89,9 +89,8 @@
 #include "uuid.h"
 
 __thread int threadid;
-uint64_t counter_en[16];
-uint64_t counter_off[16];
-uint64_t counter_de[16];
+int64_t counter_off[16];
+int64_t counter_off_rem[16];
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
 /* Auto Load Balancing Defaults */
@@ -1689,10 +1688,13 @@ dpif_netdev_init(void)
                              NULL);
     for(int i = 0; i < 16; i++)
     {
-        counter_de[i] = 0;
-        counter_en[i] = 0;
         counter_off[i] = 0;
+        counter_off_rem[i] = 0;
     }
+    rte_atomic64_init(&conn_est_count);
+    rte_atomic64_init(&conn_del_count);
+    rte_atomic64_init(&total_offloaded);
+    start = true;
     return 0;
 }
 
@@ -3018,7 +3020,6 @@ dp_netdev_flow_offload_main(void *arg)
             mov_avg_cma_update(&ofl_thread->cma, latency_us);
             mov_avg_ema_update(&ofl_thread->ema, latency_us);
             dp_netdev_free_offload(offload);
-            counter_de[ofl_thread->id]++;
             /* Do RCU synchronization at fixed interval. */
             if (now > next_rcu) {
                 ovsrcu_quiesce();
@@ -3154,10 +3155,11 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
     struct dp_offload_thread_item *item;
     struct dp_offload_flow_item *flow_offload;
     struct dp_netdev_actions *actions;
+    /*VLOG_ERR("SASA state %x ", packet_flow->ct_state);*/
     if(!(packet_flow->ct_state & 0x2))
         return;
-    /*VLOG_ERR("SASA state %x ", packet_flow->ct_state);*/
-    counter_en[threadid]++;
+    if(!start)
+        return;
     if (!netdev_is_flow_api_enabled()) {
         return;
     }
@@ -4274,7 +4276,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     memset(&flow->last_stats, 0, sizeof flow->last_stats);
     memset(&flow->last_attrs, 0, sizeof flow->last_attrs);
     flow->dead = false;
-    flow->notifiable = !!(match->wc.masks.ct_state & CS_ESTABLISHED);
+    flow->notifiable = !!(match->wc.masks.ct_state & CS_ESTABLISHED) && netdev_is_flow_api_enabled() && start;
     flow->batch = NULL;
     flow->mark = INVALID_FLOW_MARK;
     flow->orig_in_port = orig_in_port;
@@ -4846,9 +4848,10 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                               struct netdev_custom_stats *stats)
 {
     enum {
-        DP_NETDEV_HW_OFFLOADS_DPU_EN,
-        DP_NETDEV_HW_OFFLOADS_DPU_DE,
         DP_NETDEV_HW_OFFLOADS_DPU_OFF,
+        DP_NETDEV_HW_OFFLOADS_DPU_OFF_REM,
+        DP_NETDEV_HW_OFFLOADS_STATS_EST_COUNT,
+        DP_NETDEV_HW_OFFLOADS_STATS_DEL_COUNT,
         DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED,
         DP_NETDEV_HW_OFFLOADS_STATS_INSERTED,
         DP_NETDEV_HW_OFFLOADS_STATS_LAT_CMA_MEAN,
@@ -4860,12 +4863,14 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
         const char *name;
         uint64_t total;
     } hwol_stats[] = {
-        [DP_NETDEV_HW_OFFLOADS_DPU_EN] =
-            { "                DPU Elba final Enqueued", 0 },
-        [DP_NETDEV_HW_OFFLOADS_DPU_DE] =
-            { "                DPU Elba final Dequeued", 0 },
         [DP_NETDEV_HW_OFFLOADS_DPU_OFF] =
-            { "                DPU Elba final offloads", 0 },
+            { "                DPU Elba sasa final offloads", 0 },
+        [DP_NETDEV_HW_OFFLOADS_DPU_OFF_REM] =
+            { "                DPU Elba sasa removed offloads", 0 },
+        [DP_NETDEV_HW_OFFLOADS_STATS_EST_COUNT] =
+            { "                Elba: Established session event ", 0 },
+        [DP_NETDEV_HW_OFFLOADS_STATS_DEL_COUNT] =
+            { "                Elba: Delete session event ", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED] =
             { "                Enqueued offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED] =
@@ -4932,9 +4937,8 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                 mov_avg_ema(&dp_offload_threads[tid].ema);
             counts[DP_NETDEV_HW_OFFLOADS_STATS_LAT_EMA_STDDEV] =
                 mov_avg_ema_std_dev(&dp_offload_threads[tid].ema);
-            /*counts[DP_NETDEV_HW_OFFLOADS_DPU_EN] = counter_en[tid];
-            counts[DP_NETDEV_HW_OFFLOADS_DPU_DE] = counter_de[tid];
-            counts[DP_NETDEV_HW_OFFLOADS_DPU_OFF] = counter_off[tid];*/
+            counts[DP_NETDEV_HW_OFFLOADS_DPU_OFF] = counter_off[tid];
+            counts[DP_NETDEV_HW_OFFLOADS_DPU_OFF_REM] = counter_off_rem[tid];
         }
 
         for (i = 0; i < ARRAY_SIZE(hwol_stats); i++) {
@@ -4959,12 +4963,15 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
                  "  Total %s", hwol_stats[i].name);
         stats->counters[i].value = hwol_stats[i].total;
     }
+/*
     for(i = 0; i < 16; i++)
     {
-       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_EN].value += counter_en[i];
-       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_DE].value += counter_de[i];
        stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_OFF].value += counter_off[i];
+       stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_OFF].value += counter_off_rem[i];
     }
+*/
+    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_EST_COUNT].value = rte_atomic64_read(&conn_est_count);
+    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_DEL_COUNT].value = rte_atomic64_read(&conn_del_count);
     return 0;
 }
 

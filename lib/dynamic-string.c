@@ -59,7 +59,7 @@ ds_reserve(struct ds *ds, size_t min_length)
 {
     if (min_length > ds->allocated || !ds->string) {
         ds->allocated += MAX(min_length, ds->allocated);
-        ds->allocated = MAX(8, ds->allocated);
+        ds->allocated = MAX(256, ds->allocated);
         ds->string = xrealloc(ds->string, ds->allocated + 1);
     }
 }

@@ -6373,8 +6373,6 @@ netdev_dpdk_rte_flow_action_handle_create(struct netdev *netdev, bool transfer)
     struct rte_flow_action_handle *action_handle;
     struct rte_flow_error error;
 
-    memset(&error, 0 , sizeof(struct rte_flow_error));
-
     if (!is_dpdk_class(netdev->netdev_class)) {
         return NULL;
     }

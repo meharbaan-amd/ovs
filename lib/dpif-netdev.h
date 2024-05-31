@@ -37,6 +37,10 @@ bool dpif_is_netdev(const struct dpif *);
 
 #define NR_QUEUE   1
 #define NR_PMD_THREADS 1
+rte_atomic64_t conn_est_count;
+rte_atomic64_t conn_del_count;
+rte_atomic64_t total_offloaded;
+bool start;
 
 #ifdef  __cplusplus
 }
