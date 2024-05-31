@@ -143,6 +143,7 @@ struct conn {
     atomic_llong expiration;
     uint32_t mark;
     int seq_skew;
+    bool logged;
 
     /* Immutable data. */
     int32_t admit_zone; /* The zone for managing zone limit counts. */

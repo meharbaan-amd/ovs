@@ -43,6 +43,9 @@
 #include "rculist.h"
 #include "timeval.h"
 #include "unaligned.h"
+#include "dpif-netdev.h"
+#include "mpsc-queue.h"
+
 
 VLOG_DEFINE_THIS_MODULE(conntrack);
 
@@ -50,6 +53,9 @@ COVERAGE_DEFINE(conntrack_full);
 COVERAGE_DEFINE(conntrack_l3csum_err);
 COVERAGE_DEFINE(conntrack_l4csum_err);
 COVERAGE_DEFINE(conntrack_lookup_natted_miss);
+
+extern rte_atomic64_t conn_est_count;
+extern rte_atomic64_t conn_del_count;
 
 struct conn_lookup_ctx {
     struct conn_key key;
@@ -178,6 +184,80 @@ static alg_helper alg_helpers[] = {
     [CT_ALG_CTL_TFTP] = handle_tftp_ctl,
 };
 
+/*Logging Conntrack*/
+
+struct conn_queue_item {
+    struct mpsc_queue_node node;
+    /*struct ds s;*/
+    bool new_ct;
+    bool destroy_ct;
+};
+
+static struct mpsc_queue conn_queue;
+
+
+struct dequeue_thread {
+    atomic_uint64_t dequeued_item;
+};
+
+
+static void
+conn_to_ct_dpif_entry(const struct conn *conn, struct ct_dpif_entry *entry,
+                      long long now);
+
+enum ct_log_mode {
+    CT_CREATE,
+    CT_UPDATE,
+    CT_DESTROY,
+};
+/*
+static char*
+ct_mode_to_str(enum ct_log_mode mode)
+{
+    switch(mode)
+    {
+        case CT_CREATE:
+            return "Create";
+        break;
+        case CT_UPDATE:
+            return "Update";
+        break;
+        case CT_DESTROY:
+            return "Destroy";
+        break;
+        default:
+            return "INVALID Conntrack mode";
+        break;
+    }
+}
+*/
+
+static void
+log_conntrack(enum ct_log_mode mode, struct conn *conn, char* msg OVS_UNUSED)
+{
+    
+    if(conn->logged && mode!=CT_DESTROY)
+        return;
+    
+    struct conn_queue_item *item;
+    struct ct_dpif_entry entry;
+    long long now = time_msec();
+    
+    conn_to_ct_dpif_entry(conn, &entry, now);
+    item = xmalloc(sizeof *item);
+    item->new_ct = false;
+    if(mode != CT_DESTROY) //for CT_CREATE & CT_UPDATE
+    {
+        if(entry.protoinfo.tcp.state_orig == CT_DPIF_TCPS_ESTABLISHED)
+        { 
+            conn->logged=true;
+            item->new_ct = conn->logged;
+        }
+    }
+    mpsc_queue_insert(&conn_queue, &item->node);
+}
+/*Logging Conntrack Ends*/
+
 /* The maximum TCP or UDP port number. */
 #define CT_MAX_L4_PORT 65535
 /* String buffer used for parsing FTP string messages.
@@ -233,6 +313,12 @@ conn_key_cmp(const struct conn_key *key1, const struct conn_key *key2)
     return 1;
 }
 
+// kunal define dequeue thread function. 
+// atomic inc some variable ,, free struct conn_event. 
+// print atomic inc after 50000 .. take reference of counter_ct. 
+
+static void * log_dequeue(void *arg);
+
 /* Initializes the connection tracker 'ct'.  The caller is responsible for
  * calling 'conntrack_destroy()', when the instance is not needed anymore */
 struct conntrack *
@@ -240,7 +326,7 @@ conntrack_init(void)
 {
     static struct ovsthread_once setup_l4_once = OVSTHREAD_ONCE_INITIALIZER;
     struct conntrack *ct = xzalloc(sizeof *ct);
-
+    
     /* This value can be used during init (e.g. timeout_policy_init()),
      * set it first to ensure it is available.
      */
@@ -270,7 +356,16 @@ conntrack_init(void)
     latch_init(&ct->clean_thread_exit);
     ct->clean_thread = ovs_thread_create("ct_clean", clean_thread_main, ct);
     ct->ipf = ipf_init();
+    
+    VLOG_WARN("before conn_queue initialize\n");
+    // Kunal create queue and  dequeue thread here... 
+    mpsc_queue_init(&conn_queue);
 
+    struct dequeue_thread *d_thread = xzalloc(sizeof *d_thread);
+    atomic_init(&d_thread->dequeued_item, 0);
+    VLOG_WARN("before thread created\n");
+    ovs_thread_create("dequeue_log", log_dequeue, d_thread);
+    VLOG_WARN("thread created for logging\n");
     /* Initialize the l4 protocols. */
     if (ovsthread_once_start(&setup_l4_once)) {
         for (int i = 0; i < ARRAY_SIZE(l4_protos); i++) {
@@ -283,6 +378,8 @@ conntrack_init(void)
 
         ovsthread_once_done(&setup_l4_once);
     }
+    /* Intialize ct dequeue event thread */
+    
     return ct;
 }
 
@@ -455,6 +552,7 @@ conn_clean(struct conntrack *ct, struct conn *conn)
         atomic_count_dec(&zl->czl.count);
     }
 
+    log_conntrack(CT_DESTROY, conn, NULL);
     ovsrcu_postpone(delete_conn, conn);
     atomic_count_dec(&ct->n_conn);
 }
@@ -1042,6 +1140,8 @@ conn_update_state(struct conntrack *ct, struct dp_packet *pkt,
             if (ctx->reply) {
                 pkt->md.ct_state |= CS_REPLY_DIR;
             }
+            if(conn->logged==false)
+                log_conntrack(CT_UPDATE, conn, NULL);
             break;
         case CT_UPDATE_INVALID:
             pkt->md.ct_state = CS_INVALID;
@@ -1052,13 +1152,18 @@ conn_update_state(struct conntrack *ct, struct dp_packet *pkt,
                 conn_force_expire(conn);
             }
             create_new_conn = true;
+            if(conn->logged==false)
+                log_conntrack(CT_UPDATE, conn, NULL);
             break;
         case CT_UPDATE_VALID_NEW:
             pkt->md.ct_state |= CS_NEW;
+            if(conn->logged==false)
+                log_conntrack(CT_UPDATE, conn, NULL);
             break;
         default:
             OVS_NOT_REACHED();
         }
+        
     }
     return create_new_conn;
 }
@@ -1541,6 +1646,59 @@ clean_thread_main(void *f_)
     return NULL;
 }
 
+/*deque thread for conn_queue. */
+#define CONN_BACKOFF_MIN 1
+#define CONN_MAX 64
+#define CONN_QUIESCE_INTERVAL_US (10 * 1000) /* 10 ms */
+
+static void *
+log_dequeue(void *arg)
+{
+    struct dequeue_thread *d_thread = arg;
+    uint64_t backoff;
+    long long int next_rcu;
+    long long int now;
+    struct conn_queue_item *item;
+    struct mpsc_queue_node *node;
+    cpu_set_t cpuset; 
+    
+    CPU_ZERO(&cpuset);
+    CPU_SET( 15 , &cpuset);
+
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    mpsc_queue_acquire(&conn_queue);
+    
+    while(true){
+        backoff = CONN_BACKOFF_MIN;
+        while (mpsc_queue_tail(&conn_queue) == NULL) {
+            xnanosleep(backoff * 1E6);
+            if (backoff < CONN_MAX) {
+                backoff <<= 1;
+            }
+        }
+        next_rcu = time_usec() + CONN_QUIESCE_INTERVAL_US;
+        MPSC_QUEUE_FOR_EACH_POP (node, &conn_queue) {
+            atomic_count_inc64(&d_thread->dequeued_item);
+            item = CONTAINER_OF(node, struct conn_queue_item, node);
+            if(item->new_ct)
+               rte_atomic64_inc(&conn_est_count);
+            else
+               rte_atomic64_inc(&conn_del_count);
+
+            now = time_usec();
+
+            free(item);
+
+            /* Do RCU synchronization at fixed interval. */
+            if (now > next_rcu) {
+                ovsrcu_quiesce();
+                next_rcu = time_usec() + CONN_QUIESCE_INTERVAL_US;
+            }
+        }
+    }
+   return NULL;
+}
+
 /* 'Data' is a pointer to the beginning of the L3 header and 'new_data' is
  * used to store a pointer to the first byte after the L3 header.  'Size' is
  * the size of the packet beyond the data pointer. */
