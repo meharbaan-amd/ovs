@@ -1868,6 +1868,7 @@ parse_flow_match(struct netdev *netdev,
         consumed_masks->tp_src = 0;
         consumed_masks->tp_dst = 0;
         consumed_masks->tcp_flags = 0;
+        consumed_masks->ct_mark = 0;
 
         add_flow_pattern(patterns, RTE_FLOW_ITEM_TYPE_TCP, spec, mask, NULL);
     } else if (proto == IPPROTO_UDP) {
