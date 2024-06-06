@@ -191,10 +191,12 @@ static alg_helper alg_helpers[] = {
 };
 
 /*Logging Conntrack*/
+#define SHM_BUF  SHM_SIZE-8
 
 typedef struct {
-        int writeIndex;
-        char data[SHM_SIZE];
+        uint32_t writeIndex;
+        uint32_t readIndex;
+        char data[SHM_BUF];
 } SharedLog;
 
 static void
@@ -212,9 +214,7 @@ enum ct_log_mode {
 
 
 /* shared memory file descriptor */
-static sem_t *sem;
-
-static int shmid;
+static int shm_fd;
 
 SharedLog *shmaddr;
 
@@ -231,6 +231,7 @@ struct conn_tcp {
     struct tcp_peer peer[2]; /* 'conn' lock protected. */
 };
 
+int num_total_logs = (SHM_BUF) / sizeof(operd_flow_t);
 static void
 log_conntrack(enum ct_log_mode mode, struct conn *conn, char* msg OVS_UNUSED)
 {
@@ -254,13 +255,9 @@ log_conntrack(enum ct_log_mode mode, struct conn *conn, char* msg OVS_UNUSED)
     else {
         data.state = 0;
     }
-    memcpy(shmaddr->data + shmaddr->writeIndex, &data, sizeof(data));
-    shmaddr->writeIndex += sizeof(data);
-    shmaddr->writeIndex %= SHM_SIZE;
-    #if 0
-    VLOG_WARN("%s::SIP:0x%08x DIP:0x%08x SPORT:0x%04x DPORT:0x%04x\n",
-        data.state?"CREATE":"DESTROY", data.v4_tuple.src, data.v4_tuple.dst, data.v4_tuple.sport, data.v4_tuple.dport);
-    #endif
+    memcpy(shmaddr->data + shmaddr->writeIndex*sizeof(operd_flow_t), &data, sizeof(data));
+    shmaddr->writeIndex += 1;
+    shmaddr->writeIndex %= num_total_logs;
 }
 
 /*Logging Conntrack Ends*/
@@ -359,13 +356,11 @@ conntrack_init(void)
     ct->ipf = ipf_init();
 
     /* create the shared memory object */
-    sem = sem_open(SHM_NAME, O_CREAT, 0644, 0);
+    shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
 
-    key_t key = ftok("/tmp", 'A');
-    shmid = shmget(key, sizeof(SharedLog), IPC_CREAT | 0666);
-
-    VLOG_WARN("connections shm_fd: %d \n", shmid);
-    shmaddr = (SharedLog *)shmat(shmid, NULL, 0);
+    VLOG_WARN("connections shm_fd: %d \n", shm_fd);
+    ftruncate(shm_fd, SHM_SIZE);
+    shmaddr = (SharedLog *)mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
 
     /* Initialize the l4 protocols. */
     if (ovsthread_once_start(&setup_l4_once)) {
@@ -555,7 +550,7 @@ conn_clean(struct conntrack *ct, struct conn *conn)
 
     log_conntrack(CT_DESTROY, conn, NULL);
     ovsrcu_postpone(delete_conn, conn);
-    atomic_count_dec(&ct->n_conn);
+    //atomic_count_dec(&ct->n_conn);
 }
 
 static void
