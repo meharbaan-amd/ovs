@@ -394,6 +394,7 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/vconn.c \
 	lib/versions.h \
 	lib/vl-mff-map.h \
+	lib/vpp_raw_decoder.h\
 	lib/vlan-bitmap.c \
 	lib/vlan-bitmap.h \
 	lib/vlog.c \
