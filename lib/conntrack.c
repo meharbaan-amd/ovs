@@ -63,9 +63,6 @@ COVERAGE_DEFINE(conntrack_l3csum_err);
 COVERAGE_DEFINE(conntrack_l4csum_err);
 COVERAGE_DEFINE(conntrack_lookup_natted_miss);
 
-extern rte_atomic64_t conn_est_count;
-extern rte_atomic64_t conn_del_count;
-
 struct conn_lookup_ctx {
     struct conn_key key;
     struct conn *conn;
