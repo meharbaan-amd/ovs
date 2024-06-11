@@ -1691,9 +1691,9 @@ dpif_netdev_init(void)
         counter_off[i] = 0;
         counter_off_rem[i] = 0;
     }
-    rte_atomic64_init(&conn_est_count);
-    rte_atomic64_init(&conn_del_count);
+#ifdef DPDK_NETDEV
     rte_atomic64_init(&total_offloaded);
+#endif
     start = true;
     return 0;
 }
@@ -4850,8 +4850,6 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
     enum {
         DP_NETDEV_HW_OFFLOADS_DPU_OFF,
         DP_NETDEV_HW_OFFLOADS_DPU_OFF_REM,
-        DP_NETDEV_HW_OFFLOADS_STATS_EST_COUNT,
-        DP_NETDEV_HW_OFFLOADS_STATS_DEL_COUNT,
         DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED,
         DP_NETDEV_HW_OFFLOADS_STATS_INSERTED,
         DP_NETDEV_HW_OFFLOADS_STATS_LAT_CMA_MEAN,
@@ -4867,10 +4865,6 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
             { "                DPU Elba sasa final offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_DPU_OFF_REM] =
             { "                DPU Elba sasa removed offloads", 0 },
-        [DP_NETDEV_HW_OFFLOADS_STATS_EST_COUNT] =
-            { "                Elba: Established session event ", 0 },
-        [DP_NETDEV_HW_OFFLOADS_STATS_DEL_COUNT] =
-            { "                Elba: Delete session event ", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_ENQUEUED] =
             { "                Enqueued offloads", 0 },
         [DP_NETDEV_HW_OFFLOADS_STATS_INSERTED] =
@@ -4970,8 +4964,6 @@ dpif_netdev_offload_stats_get(struct dpif *dpif,
        stats->counters[DP_NETDEV_HW_OFFLOADS_DPU_OFF].value += counter_off_rem[i];
     }
 */
-    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_EST_COUNT].value = rte_atomic64_read(&conn_est_count);
-    stats->counters[DP_NETDEV_HW_OFFLOADS_STATS_DEL_COUNT].value = rte_atomic64_read(&conn_del_count);
     return 0;
 }
 

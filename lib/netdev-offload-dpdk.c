@@ -2668,12 +2668,15 @@ netdev_offload_dpdk_flow_destroy(struct ufid_to_rte_flow_data *rte_flow_data)
                 {
                     //counter_off[i]--;
                     counter_off_rem[i]++;
+
+#ifdef DPDK_NETDEV
                     rte_atomic64_dec(&total_offloaded);
                     if(rte_atomic64_read(&total_offloaded) <= 0)
                     {
                         start = true;
                         VLOG_ERR("Offloading started");
                     }
+#endif
                 }
                 cmap_remove(&rte_flow_data->ct_flows[i], &data->node, data->hash);
                 ovsrcu_postpone(free, data);
@@ -2881,12 +2884,14 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             conn_key_extract_from_flow(&match.flow, &ct_data->conn_key);
 
             counter_off[threadid]++;
+#ifdef DPDK_NETDEV
             rte_atomic64_inc(&total_offloaded);
             if(rte_atomic64_read(&total_offloaded) >= 800000)
             {
                  start = false;          
                 VLOG_ERR("Offloading stopped");
             }
+#endif
             cmap_insert(&rte_flow_data->ct_flows[threadid],
                         CONST_CAST(struct cmap_node *, &ct_data->node), hash);
         }
@@ -3019,12 +3024,14 @@ netdev_offload_dpdk_flow_get(struct netdev *netdev,
                     {
                         //counter_off[i]--;
                         counter_off_rem[i]++;
+#ifdef DPDK_NETDEV
                         rte_atomic64_dec(&total_offloaded);
                         if(rte_atomic64_read(&total_offloaded) <= 0)
                         {
                             start = true;
                             VLOG_ERR("Offloading started");
                         }
+#endif
                     }
                     ovsrcu_postpone(free, data);
                 }
