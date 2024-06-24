@@ -3,7 +3,7 @@
 #define __IPC_RAW__HPP__
 
 #define SHM_NAME "/conn_shared_memory" // Shared memory name
-#define SHM_SIZE 524288              // Shared memory size 512*1024
+#define SHM_SIZE 10*512*1024              // Shared memory size
 
 typedef struct operd_flow_key_v4 {
     uint32_t src;
