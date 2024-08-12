@@ -309,15 +309,14 @@ int
 netdev_flow_put(struct netdev *netdev, struct match *match,
                 struct nlattr *actions, size_t act_len,
                 const ovs_u128 *ufid, struct offload_info *info,
-                struct dpif_flow_stats *stats, struct conntrack *conntrack)
+                struct dpif_flow_stats *stats, struct conntrack *conntrack, odp_port_t odp_out_port)
 {
     const struct netdev_flow_api *flow_api =
         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
     if(netdev_vport_is_vport_class(netdev->netdev_class))
-            VLOG_ERR("SASA For nedev %s flow apu is %p ", netdev->name, flow_api);
-       
-       
+            VLOG_ERR("SASA For netdev %s flow api is %p ", netdev->name, flow_api);
 
+    info->odp_out_port = odp_out_port;
     return (flow_api && flow_api->flow_put)
            ? flow_api->flow_put(netdev, match, actions, act_len, ufid,
                                 info, stats, conntrack)
@@ -329,14 +328,13 @@ netdev_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
                    struct flow *flow,
                    const struct pkt_metadata_nat *pre_nat_tuple,
                    struct nlattr *actions, size_t act_len,
-                   odp_port_t orig_in_port)
+                   odp_port_t orig_in_port, odp_port_t odp_out_port)
 {
     const struct netdev_flow_api *flow_api =
         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
-
     return (flow_api && flow_api->flow_notify)
            ? flow_api->flow_notify(netdev, ufid, flow, pre_nat_tuple,
-                                   actions, act_len, orig_in_port)
+                                   actions, act_len, orig_in_port, odp_out_port)
            : EOPNOTSUPP;
 }
 

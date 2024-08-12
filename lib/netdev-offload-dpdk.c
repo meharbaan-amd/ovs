@@ -2047,11 +2047,14 @@ add_output_action(struct netdev *netdev,
     outdev = netdev_ports_get(port, netdev->dpif_type);
     if (outdev == NULL) {
         VLOG_DBG_RL(&rl, "Cannot find netdev for odp port %"PRIu32, port);
+        VLOG_WARN("outdev==NULL Cannot find netdev for odp port %"PRIu32, port);
         return -1;
     }
     if (!netdev_flow_api_equals(netdev, outdev) ||
         add_represented_port_action(actions, outdev)) {
         VLOG_DBG_RL(&rl, "%s: Output to port \'%s\' cannot be offloaded.",
+                    netdev_get_name(netdev), netdev_get_name(outdev));
+        VLOG_WARN("%s: Output to port \'%s\' cannot be offloaded.",
                     netdev_get_name(netdev), netdev_get_name(outdev));
         ret = -1;
     }
@@ -2413,13 +2416,15 @@ static int
 parse_flow_actions(struct netdev *netdev,
                    struct flow_actions *actions,
                    struct nlattr *nl_actions,
-                   size_t nl_actions_len)
+                   size_t nl_actions_len,
+                   odp_port_t odp_out_port)
 {
     struct nlattr *nla;
     size_t left;
 
     add_count_action(actions);
     NL_ATTR_FOR_EACH_UNSAFE (nla, left, nl_actions, nl_actions_len) {
+
         if (nl_attr_type(nla) == OVS_ACTION_ATTR_OUTPUT) {
             if (add_output_action(netdev, actions, nla)) {
                 return -1;
@@ -2463,7 +2468,25 @@ parse_flow_actions(struct netdev *netdev,
                 return -1;
             }
 #endif
-        } else {
+        } else if ((nl_attr_type(nla) == OVS_ACTION_ATTR_LB_OUTPUT))
+        {
+            struct netdev *outdev;
+            odp_port_t port = odp_out_port;
+            outdev = netdev_ports_get(port, netdev->dpif_type);
+            if (outdev == NULL) {
+                VLOG_ERR("Cannot find netdev for odp port %"PRIu32, port);
+                VLOG_ERR("outdev==NULL Cannot find netdev for odp port %"PRIu32, port);
+                return -1;
+            }
+            if (!netdev_flow_api_equals(netdev, outdev) ||
+                add_represented_port_action(actions, outdev)) {
+                    VLOG_ERR("%s: Output to port \'%s\' cannot be offloaded.",
+                        netdev_get_name(netdev), netdev_get_name(outdev));
+                    return -1;
+            }
+            netdev_close(outdev);
+        }
+        else {
             VLOG_DBG_RL(&rl, "Unsupported action type %d", nl_attr_type(nla));
             return -1;
         }
@@ -2485,7 +2508,8 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
                             size_t actions_len,
                             struct rte_flow_action_handle *action_handle,
                             const struct match *match,
-                            const struct pkt_metadata_nat *pre_nat_tuple __rte_unused)
+                            const struct pkt_metadata_nat *pre_nat_tuple __rte_unused,
+                            odp_port_t odp_out_port)
 {
     const struct rte_flow_attr flow_attr = { .transfer = 1, };
     struct flow_actions actions = {
@@ -2544,7 +2568,7 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
                                RTE_FLOW_ACTION_TYPE_SET_TP_DST, set_port);
     }
 
-    ret = parse_flow_actions(netdev, &actions, nl_actions, actions_len);
+    ret = parse_flow_actions(netdev, &actions, nl_actions, actions_len, odp_out_port);
     if (ret) {
         goto out;
     }
@@ -2597,7 +2621,7 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
     }
     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
                                        actions_len, action_handle, &orig_match,
-                                       info->pre_nat_tuple);
+                                       info->pre_nat_tuple, info->odp_out_port);
     if (!flow && !netdev_vport_is_vport_class(netdev->netdev_class)) {
         /* If we failed to offload the rule actions fallback to MARK+RSS
          * actions.
@@ -2807,6 +2831,7 @@ netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
                                 struct nlattr *nl_actions,
                                 size_t actions_len,
                                 odp_port_t orig_in_port,
+                                odp_port_t odp_out_port,
                                 struct rte_flow_action_handle *action_handle)
 {
     struct flow_patterns patterns = {
@@ -2832,7 +2857,8 @@ netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
 
     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
                                        actions_len, action_handle, match,
-                                       pre_nat_tuple);
+                                       //pre_nat_tuple);
+                                       pre_nat_tuple, odp_out_port);
     if (!flow) {
         VLOG_ERR("%s: failed to offload notified flow",
                     netdev_get_name(netdev));
@@ -2849,7 +2875,8 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
                                 const struct flow *packet_flow,
                                 const struct pkt_metadata_nat *pre_nat_tuple,
                                 struct nlattr *actions, size_t actions_len,
-                                odp_port_t orig_in_port)
+                                odp_port_t orig_in_port,
+                                odp_port_t odp_out_port)
 {
     struct ufid_to_rte_flow_data *rte_flow_data;
     struct rte_flow *rte_flow;
@@ -2858,6 +2885,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
     uint32_t hash;
 
     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
+
     if (OVS_LIKELY(rte_flow_data) && rte_flow_data->ct) {
         hash = hash_ct_tuple(packet_flow);
         if(ovs_mutex_trylock(&rte_flow_data->lock[threadid]))
@@ -2871,6 +2899,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             rte_flow = netdev_offload_dpdk_add_ct_flow(netdev, &match,
                                                        pre_nat_tuple, actions,
                                                        actions_len, orig_in_port,
+                                                       odp_out_port,
                                                        rte_flow_data->rte_flow_action_handle);
             if (!rte_flow) {
                 ovs_mutex_unlock(&rte_flow_data->lock[threadid]);
@@ -2888,7 +2917,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
             rte_atomic64_inc(&total_offloaded);
             if(rte_atomic64_read(&total_offloaded) >= 800000)
             {
-                 start = false;          
+                 start = false; 
                 VLOG_ERR("Offloading stopped");
             }
 #endif
@@ -2897,7 +2926,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
         }
 
         ovs_mutex_unlock(&rte_flow_data->lock[threadid]);
-    } 
+    }
 
     return 0;
 }

@@ -1,0 +1,501 @@
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 687ef5590..f1b509638 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -391,8 +391,8 @@ struct dp_offload_thread_item {
+     long long int timestamp;
+     struct dp_netdev *dp;
+     uint8_t id;
++    odp_port_t odp_out_port;
+     union dp_offload_thread_data data[0];
+- 
+ };
+ 
+ struct dp_offload_thread {
+@@ -2252,7 +2252,6 @@ dpif_netdev_port_add(struct dpif *dpif, struct netdev *netdev,
+         error = do_add_port(dp, dpif_port, netdev_get_type(netdev), port_no);
+     }
+     ovs_rwlock_unlock(&dp->port_rwlock);
+-
+     return error;
+ }
+ 
+@@ -2772,7 +2771,7 @@ dp_netdev_offload_flow_enqueue(struct dp_offload_thread_item *item)
+     tid = item->id;
+     dp_netdev_append_offload(item, tid);
+ }
+-// 0th 0  --> dequeue 8  
++// 0th 0  --> dequeue 8
+ // 1   1  --> dequeue 9
+ 
+ static int
+@@ -2828,17 +2827,16 @@ dp_netdev_flow_offload_put(struct dp_offload_thread_item *item)
+             }
+             return 0;
+         }
+-
+         mark = flow_mark_alloc();
+         if (mark == INVALID_FLOW_MARK) {
+             VLOG_ERR("Failed to allocate flow mark!\n");
+             return -1;
+         }
+     }
++
+     info.flow_mark = mark;
+     info.orig_in_port = offload->orig_in_port;
+     info.pre_nat_tuple = &offload->pre_nat_tuple;
+-
+     port = netdev_ports_get(in_port, dpif_type_str);
+     if (!port) {
+         goto err_free;
+@@ -2850,7 +2848,7 @@ dp_netdev_flow_offload_put(struct dp_offload_thread_item *item)
+     ret = netdev_flow_put(port, &offload->match,
+                           CONST_CAST(struct nlattr *, offload->actions),
+                           offload->actions_len, &flow->mega_ufid, &info,
+-                          NULL, dp->conntrack);
++                          NULL, dp->conntrack, item->odp_out_port);
+     ovs_rwlock_unlock(&dp->port_rwlock);
+     netdev_close(port);
+ 
+@@ -2899,7 +2897,8 @@ dp_netdev_flow_offload_notify(struct dp_offload_thread_item *item)
+     ret = netdev_flow_notify(port, &flow->mega_ufid, &offload->match.flow,
+                              &offload->pre_nat_tuple,
+                              CONST_CAST(struct nlattr *, offload->actions),
+-                             offload->actions_len, offload->orig_in_port);
++//                             offload->actions_len, offload->orig_in_port);
++                             offload->actions_len, offload->orig_in_port, item->odp_out_port);
+     ovs_rwlock_unlock(&dp->port_rwlock);
+     netdev_close(port);
+ 
+@@ -3121,7 +3120,8 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
+                       const struct pkt_metadata_nat *pre_nat_tuple,
+                       struct match *match,
+                       const struct nlattr *actions, size_t actions_len,
+-                      int op)
++                      //int op)
++                      int op, odp_port_t odp_out_port)
+ {
+     struct dp_offload_thread_item *item;
+     struct dp_offload_flow_item *flow_offload;
+@@ -3142,6 +3142,7 @@ queue_netdev_flow_put(struct dp_netdev_pmd_thread *pmd,
+     }
+ 
+     item->timestamp = pmd->ctx.now;
++    item->odp_out_port = odp_out_port;
+     dp_netdev_offload_flow_enqueue(item);
+ }
+ 
+@@ -3150,12 +3151,12 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
+                          struct dp_netdev_flow *flow,
+                          const struct pkt_metadata_nat *pre_nat_tuple,
+                          struct flow *packet_flow,
+-                         odp_port_t orig_in_port OVS_UNUSED)
++                         odp_port_t orig_in_port OVS_UNUSED,
++                         odp_port_t odp_out_port)
+ {
+     struct dp_offload_thread_item *item;
+     struct dp_offload_flow_item *flow_offload;
+     struct dp_netdev_actions *actions;
+-    /*VLOG_ERR("SASA state %x ", packet_flow->ct_state);*/
+     if(!(packet_flow->ct_state & 0x2))
+         return;
+     if(!start)
+@@ -3178,14 +3179,15 @@ queue_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
+     item->id = pmd->core_id;
+ 
+     item->timestamp = pmd->ctx.now;
++    item->odp_out_port = odp_out_port;
+     //dp_netdev_offload_flow_enqueue(item);
+ #if 1
+     dp_netdev_flow_offload_notify(item);
+-    
++
+     dp_netdev_flow_unref(flow_offload->flow);
+     dp_netdev_free_flow_offload__(item);
+ #endif
+-    
++
+ }
+ 
+ static void
+@@ -4240,6 +4242,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+                    struct match *match, const ovs_u128 *ufid,
+                    const struct nlattr *actions, size_t actions_len,
+                    odp_port_t orig_in_port,
++                   odp_port_t odp_out_port,
+                    struct pkt_metadata_nat *pre_nat_tuple)
+     OVS_REQUIRES(pmd->flow_mutex)
+ {
+@@ -4312,9 +4315,8 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
+     if (dp_netdev_flow_is_simple_match(match)) {
+         dp_netdev_simple_match_insert(pmd, flow);
+     }
+-
+     queue_netdev_flow_put(pmd, flow, pre_nat_tuple, match, actions, actions_len,
+-                          DP_NETDEV_FLOW_OFFLOAD_OP_ADD);
++                          DP_NETDEV_FLOW_OFFLOAD_OP_ADD, odp_out_port);
+     log_netdev_flow_change(flow, match, NULL, actions, actions_len);
+ 
+     return flow;
+@@ -4325,13 +4327,13 @@ dp_netdev_flow_notify(struct dp_netdev_pmd_thread *pmd,
+                       struct dp_netdev_flow *flow,
+                       const struct pkt_metadata_nat *pre_nat_tuple,
+                       const struct netdev_flow_key *key,
+-                      odp_port_t in_port)
++                      //odp_port_t in_port)
++                      odp_port_t in_port, odp_port_t odp_out_port)
+ {
+     struct flow packet_flow;
+ 
+     miniflow_expand(&key->mf, &packet_flow);
+-
+-    queue_netdev_flow_notify(pmd, flow, pre_nat_tuple, &packet_flow, in_port);
++    queue_netdev_flow_notify(pmd, flow, pre_nat_tuple, &packet_flow, in_port, odp_out_port);
+ }
+ 
+ static int
+@@ -4362,7 +4364,8 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
+     if (put->flags & DPIF_FP_CREATE) {
+         if (!netdev_flow) {
+             dp_netdev_flow_add(pmd, match, ufid,
+-                               put->actions, put->actions_len, ODPP_NONE, NULL);
++                               //put->actions, put->actions_len, ODPP_NONE, NULL);
++                               put->actions, put->actions_len, ODPP_NONE, ODPP_NONE, NULL);
+         } else {
+             error = EEXIST;
+         }
+@@ -4390,7 +4393,8 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
+ 
+             queue_netdev_flow_put(pmd, netdev_flow, NULL, match,
+                                   put->actions, put->actions_len,
+-                                  DP_NETDEV_FLOW_OFFLOAD_OP_MOD);
++                                  //DP_NETDEV_FLOW_OFFLOAD_OP_MOD);
++                                  DP_NETDEV_FLOW_OFFLOAD_OP_MOD, ODPP_NONE);
+             log_netdev_flow_change(netdev_flow, match, old_actions,
+                                    put->actions, put->actions_len);
+ 
+@@ -8568,6 +8572,30 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
+     return dp_packet_batch_size(packets_);
+ }
+ 
++static inline odp_port_t
++get_odp_out_port(struct dp_netdev_pmd_thread *pmd,
++                 struct dp_packet *packet)
++{
++    odp_port_t odp_out_port = ODPP_NONE;
++    struct tx_bond *p_bond = tx_bond_lookup(&pmd->tx_bonds, 1);
++    if(p_bond)
++    {
++        uint32_t hash = dp_packet_get_rss_hash(packet);
++        struct member_entry *s_entry = &p_bond->member_buckets[hash & BOND_MASK];
++
++        uint32_t i=0;
++        char arr[0xff+1]={0};
++        for(i=0;i<=0xff;i++)
++        {
++            struct member_entry *ls_entry = &p_bond->member_buckets[i & BOND_MASK];
++            arr[i] = ls_entry->member_id + '0';
++        }
++        odp_out_port = s_entry->member_id;
++    }
++
++    return odp_out_port;
++}
++
+ static inline int
+ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+                      struct dp_packet *packet,
+@@ -8620,12 +8648,13 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+     if (OVS_LIKELY(error != ENOSPC)) {
+         if (!packet->md.ct_required) {
+             struct dp_netdev_flow *netdev_flow;
+-
++            odp_port_t odp_out_port = get_odp_out_port(pmd, packet);
+             /* XXX: There's a race window where a flow covering this packet
+              * could have already been installed since we last did the flow
+              * lookup before upcall.  This could be solved by moving the
+              * mutex lock outside the loop, but that's an awful long time
+              * to be locking revalidators out of making flow modifications. */
++
+             ovs_mutex_lock(&pmd->flow_mutex);
+             netdev_flow = dp_netdev_pmd_lookup_flow(pmd, key, NULL);
+             if (OVS_LIKELY(!netdev_flow)) {
+@@ -8633,11 +8662,13 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
+                                                  add_actions->data,
+                                                  add_actions->size,
+                                                  orig_in_port,
++                                                 odp_out_port,
+                                                  &packet->md.ct_pre_nat_tuple);
+             } else if (netdev_flow->notifiable) {
+                 dp_netdev_flow_notify(pmd, netdev_flow,
+                                       &packet->md.ct_pre_nat_tuple, key,
+-                                      orig_in_port);
++                                      orig_in_port,
++                                      odp_out_port);
+             }
+             ovs_mutex_unlock(&pmd->flow_mutex);
+             if (netdev_flow) {
+@@ -8755,8 +8786,10 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
+         flow = dp_netdev_flow_cast(rules[i]);
+ 
+         if (flow->notifiable) {
++            odp_port_t odp_out_port = get_odp_out_port(pmd, packet);
+             dp_netdev_flow_notify(pmd, flow, &packet->md.ct_pre_nat_tuple,
+-                                  keys[i], in_port);
++                                  //keys[i], in_port);
++                                  keys[i], in_port, odp_out_port);
+         }
+ 
+         uint32_t hash =  dp_netdev_flow_hash(&flow->ufid);
+diff --git a/lib/dpif-netlink.c b/lib/dpif-netlink.c
+index 4a8d8e8c5..18d133bf5 100644
+--- a/lib/dpif-netlink.c
++++ b/lib/dpif-netlink.c
+@@ -2303,7 +2303,8 @@ parse_flow_put(struct dpif_netlink *dpif, struct dpif_flow_put *put)
+                           CONST_CAST(struct nlattr *, put->actions),
+                           put->actions_len,
+                           CONST_CAST(ovs_u128 *, put->ufid),
+-                          &info, put->stats, NULL);
++          //                &info, put->stats, NULL);
++                          &info, put->stats, NULL, ODPP_NONE);
+ 
+     if (!err) {
+         if (put->flags & DPIF_FP_MODIFY) {
+diff --git a/lib/netdev-offload-dpdk.c b/lib/netdev-offload-dpdk.c
+index e4f2077e3..dbd70c91a 100644
+--- a/lib/netdev-offload-dpdk.c
++++ b/lib/netdev-offload-dpdk.c
+@@ -2047,12 +2047,15 @@ add_output_action(struct netdev *netdev,
+     outdev = netdev_ports_get(port, netdev->dpif_type);
+     if (outdev == NULL) {
+         VLOG_DBG_RL(&rl, "Cannot find netdev for odp port %"PRIu32, port);
++        VLOG_WARN("outdev==NULL Cannot find netdev for odp port %"PRIu32, port);
+         return -1;
+     }
+     if (!netdev_flow_api_equals(netdev, outdev) ||
+         add_represented_port_action(actions, outdev)) {
+         VLOG_DBG_RL(&rl, "%s: Output to port \'%s\' cannot be offloaded.",
+                     netdev_get_name(netdev), netdev_get_name(outdev));
++        VLOG_WARN("%s: Output to port \'%s\' cannot be offloaded.",
++                    netdev_get_name(netdev), netdev_get_name(outdev));
+         ret = -1;
+     }
+     netdev_close(outdev);
+@@ -2413,13 +2416,15 @@ static int
+ parse_flow_actions(struct netdev *netdev,
+                    struct flow_actions *actions,
+                    struct nlattr *nl_actions,
+-                   size_t nl_actions_len)
++                   size_t nl_actions_len,
++                   odp_port_t odp_out_port)
+ {
+     struct nlattr *nla;
+     size_t left;
+ 
+     add_count_action(actions);
+     NL_ATTR_FOR_EACH_UNSAFE (nla, left, nl_actions, nl_actions_len) {
++
+         if (nl_attr_type(nla) == OVS_ACTION_ATTR_OUTPUT) {
+             if (add_output_action(netdev, actions, nla)) {
+                 return -1;
+@@ -2463,7 +2468,25 @@ parse_flow_actions(struct netdev *netdev,
+                 return -1;
+             }
+ #endif
+-        } else {
++        } else if ((nl_attr_type(nla) == OVS_ACTION_ATTR_LB_OUTPUT))
++        {
++            struct netdev *outdev;
++            odp_port_t port = odp_out_port;
++            outdev = netdev_ports_get(port, netdev->dpif_type);
++            if (outdev == NULL) {
++                VLOG_ERR("Cannot find netdev for odp port %"PRIu32, port);
++                VLOG_ERR("outdev==NULL Cannot find netdev for odp port %"PRIu32, port);
++                return -1;
++            }
++            if (!netdev_flow_api_equals(netdev, outdev) ||
++                add_represented_port_action(actions, outdev)) {
++                    VLOG_ERR("%s: Output to port \'%s\' cannot be offloaded.",
++                        netdev_get_name(netdev), netdev_get_name(outdev));
++                    return -1;
++            }
++            netdev_close(outdev);
++        }
++        else {
+             VLOG_DBG_RL(&rl, "Unsupported action type %d", nl_attr_type(nla));
+             return -1;
+         }
+@@ -2485,7 +2508,8 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
+                             size_t actions_len,
+                             struct rte_flow_action_handle *action_handle,
+                             const struct match *match,
+-                            const struct pkt_metadata_nat *pre_nat_tuple __rte_unused)
++                            const struct pkt_metadata_nat *pre_nat_tuple __rte_unused,
++                            odp_port_t odp_out_port)
+ {
+     const struct rte_flow_attr flow_attr = { .transfer = 1, };
+     struct flow_actions actions = {
+@@ -2544,7 +2568,7 @@ netdev_offload_dpdk_actions(struct netdev *netdev,
+                                RTE_FLOW_ACTION_TYPE_SET_TP_DST, set_port);
+     }
+ 
+-    ret = parse_flow_actions(netdev, &actions, nl_actions, actions_len);
++    ret = parse_flow_actions(netdev, &actions, nl_actions, actions_len, odp_out_port);
+     if (ret) {
+         goto out;
+     }
+@@ -2597,7 +2621,7 @@ netdev_offload_dpdk_add_flow(struct netdev *netdev,
+     }
+     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
+                                        actions_len, action_handle, &orig_match,
+-                                       info->pre_nat_tuple);
++                                       info->pre_nat_tuple, info->odp_out_port);
+     if (!flow && !netdev_vport_is_vport_class(netdev->netdev_class)) {
+         /* If we failed to offload the rule actions fallback to MARK+RSS
+          * actions.
+@@ -2807,6 +2831,7 @@ netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
+                                 struct nlattr *nl_actions,
+                                 size_t actions_len,
+                                 odp_port_t orig_in_port,
++                                odp_port_t odp_out_port,
+                                 struct rte_flow_action_handle *action_handle)
+ {
+     struct flow_patterns patterns = {
+@@ -2832,7 +2857,8 @@ netdev_offload_dpdk_add_ct_flow(struct netdev *netdev,
+ 
+     flow = netdev_offload_dpdk_actions(patterns.physdev, &patterns, nl_actions,
+                                        actions_len, action_handle, match,
+-                                       pre_nat_tuple);
++                                       //pre_nat_tuple);
++                                       pre_nat_tuple, odp_out_port);
+     if (!flow) {
+         VLOG_ERR("%s: failed to offload notified flow",
+                     netdev_get_name(netdev));
+@@ -2849,7 +2875,8 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+                                 const struct flow *packet_flow,
+                                 const struct pkt_metadata_nat *pre_nat_tuple,
+                                 struct nlattr *actions, size_t actions_len,
+-                                odp_port_t orig_in_port)
++                                odp_port_t orig_in_port,
++                                odp_port_t odp_out_port)
+ {
+     struct ufid_to_rte_flow_data *rte_flow_data;
+     struct rte_flow *rte_flow;
+@@ -2858,6 +2885,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+     uint32_t hash;
+ 
+     rte_flow_data = ufid_to_rte_flow_data_find(netdev, ufid, false);
++
+     if (OVS_LIKELY(rte_flow_data) && rte_flow_data->ct) {
+         hash = hash_ct_tuple(packet_flow);
+         if(ovs_mutex_trylock(&rte_flow_data->lock[threadid]))
+@@ -2871,6 +2899,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+             rte_flow = netdev_offload_dpdk_add_ct_flow(netdev, &match,
+                                                        pre_nat_tuple, actions,
+                                                        actions_len, orig_in_port,
++                                                       odp_out_port,
+                                                        rte_flow_data->rte_flow_action_handle);
+             if (!rte_flow) {
+                 ovs_mutex_unlock(&rte_flow_data->lock[threadid]);
+@@ -2888,7 +2917,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+             rte_atomic64_inc(&total_offloaded);
+             if(rte_atomic64_read(&total_offloaded) >= 800000)
+             {
+-                 start = false;          
++                 start = false; 
+                 VLOG_ERR("Offloading stopped");
+             }
+ #endif
+@@ -2897,7 +2926,7 @@ netdev_offload_dpdk_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+         }
+ 
+         ovs_mutex_unlock(&rte_flow_data->lock[threadid]);
+-    } 
++    }
+ 
+     return 0;
+ }
+diff --git a/lib/netdev-offload-provider.h b/lib/netdev-offload-provider.h
+index e5b5e2d42..aa09ac438 100644
+--- a/lib/netdev-offload-provider.h
++++ b/lib/netdev-offload-provider.h
+@@ -78,7 +78,8 @@ struct netdev_flow_api {
+      * Return 0 if successful, otherwise returns a positive errno value. */
+     int (*flow_notify)(struct netdev *, const ovs_u128 *, const struct flow *,
+                        const struct pkt_metadata_nat *, struct nlattr *actions,
+-                       size_t actions_len, odp_port_t orig_in_port);
++                       size_t actions_len, odp_port_t orig_in_port,
++                       odp_port_t odp_out_port);
+ 
+     /* Queries a flow specified by ufid on netdev.
+      * Fills output buffer as 'wbuffer' in flow_dump_next, which
+diff --git a/lib/netdev-offload.c b/lib/netdev-offload.c
+index 68200aeb5..6cdb15fc6 100644
+--- a/lib/netdev-offload.c
++++ b/lib/netdev-offload.c
+@@ -309,15 +309,14 @@ int
+ netdev_flow_put(struct netdev *netdev, struct match *match,
+                 struct nlattr *actions, size_t act_len,
+                 const ovs_u128 *ufid, struct offload_info *info,
+-                struct dpif_flow_stats *stats, struct conntrack *conntrack)
++                struct dpif_flow_stats *stats, struct conntrack *conntrack, odp_port_t odp_out_port)
+ {
+     const struct netdev_flow_api *flow_api =
+         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
+     if(netdev_vport_is_vport_class(netdev->netdev_class))
+-            VLOG_ERR("SASA For nedev %s flow apu is %p ", netdev->name, flow_api);
+-       
+-       
++            VLOG_ERR("SASA For netdev %s flow api is %p ", netdev->name, flow_api);
+ 
++    info->odp_out_port = odp_out_port;
+     return (flow_api && flow_api->flow_put)
+            ? flow_api->flow_put(netdev, match, actions, act_len, ufid,
+                                 info, stats, conntrack)
+@@ -329,14 +328,13 @@ netdev_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+                    struct flow *flow,
+                    const struct pkt_metadata_nat *pre_nat_tuple,
+                    struct nlattr *actions, size_t act_len,
+-                   odp_port_t orig_in_port)
++                   odp_port_t orig_in_port, odp_port_t odp_out_port)
+ {
+     const struct netdev_flow_api *flow_api =
+         ovsrcu_get(const struct netdev_flow_api *, &netdev->flow_api);
+-
+     return (flow_api && flow_api->flow_notify)
+            ? flow_api->flow_notify(netdev, ufid, flow, pre_nat_tuple,
+-                                   actions, act_len, orig_in_port)
++                                   actions, act_len, orig_in_port, odp_out_port)
+            : EOPNOTSUPP;
+ }
+ 
+diff --git a/lib/netdev-offload.h b/lib/netdev-offload.h
+index 358a43f90..b3490f245 100644
+--- a/lib/netdev-offload.h
++++ b/lib/netdev-offload.h
+@@ -81,7 +81,7 @@ struct offload_info {
+     bool tc_modify_flow_deleted; /* Indicate the tc modify flow put success
+                                   * to delete the original flow. */
+     odp_port_t orig_in_port; /* Originating in_port for tnl flows. */
+-
++    odp_port_t odp_out_port;
+     const struct pkt_metadata_nat *pre_nat_tuple;
+ };
+ 
+@@ -114,12 +114,14 @@ bool netdev_flow_dump_next(struct netdev_flow_dump *, struct match *,
+ int netdev_flow_put(struct netdev *, struct match *, struct nlattr *actions,
+                     size_t actions_len, const ovs_u128 *,
+                     struct offload_info *, struct dpif_flow_stats *,
+-                    struct conntrack *);
++                    //struct conntrack *);
++                    struct conntrack *, odp_port_t );
+ int netdev_flow_notify(struct netdev *netdev, const ovs_u128 *ufid,
+                        struct flow *flow,
+                        const struct pkt_metadata_nat *pre_nat_tuple,
+                        struct nlattr *actions, size_t act_len,
+-                       odp_port_t orig_in_port);
++//                       odp_port_t orig_in_port);
++                       odp_port_t orig_in_port, odp_port_t odp_out_port);
+ int netdev_hw_miss_packet_recover(struct netdev *, struct dp_packet *);
+ int netdev_flow_get(struct netdev *, struct match *, struct nlattr **actions,
+                     const ovs_u128 *, struct dpif_flow_stats *,
